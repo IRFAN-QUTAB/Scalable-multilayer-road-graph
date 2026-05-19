@@ -20,9 +20,7 @@ class RoutingApp:
         except Exception:
             pass
 
-    # ==========================================================
-    # GRAPH PROJECTION — primal graph, distance weighted
-    # ==========================================================
+  
     def create_projected_graph(self):
         """
         Primal graph projection for Dijkstra routing.
@@ -56,9 +54,7 @@ class RoutingApp:
         with self.driver.session() as session:
             self._safe_drop_graph(session, 'graph')
 
-    # ==========================================================
-    # PAGERANK — dual graph, unweighted
-    # ==========================================================
+
     def get_pagerank_roads(self):
         """Rank roads by PageRank on dual graph."""
         with self.driver.session() as session:
@@ -88,9 +84,7 @@ class RoutingApp:
             self._safe_drop_graph(session, 'dual_pr')
             return df
 
-    # ==========================================================
-    # ROAD CLOSURE — on ROUTE relationships (primal graph)
-    # ==========================================================
+
     def close_roads(self, road_names):
         """Close roads by setting temp_status on ROUTE relationships."""
         if not road_names:
@@ -114,9 +108,6 @@ class RoutingApp:
                 REMOVE r.temp_status
             """).consume()
 
-    # ==========================================================
-    # ROAD COORDINATES — for map visualization
-    # ==========================================================
     def get_road_coordinates(self, road_names):
         if not road_names:
             return []
@@ -131,9 +122,7 @@ class RoutingApp:
             """, roads=road_names)
             return [dict(r) for r in result]
 
-    # ==========================================================
-    # POI COMBINATIONS — FIX: temp_status check added
-    # ==========================================================
+
     def generate_possible_combinations(self, source, target):
         """
         Find nearest junctions to source/target POIs.
@@ -162,9 +151,7 @@ class RoutingApp:
             """, source=source, target=target)
             return result.values()
 
-    # ==========================================================
-    # SHORTEST PATH — Dijkstra by distance
-    # ==========================================================
+
     def read_distance_path(self, source, target):
         with self.driver.session() as session:
             result = session.run("""
@@ -197,9 +184,7 @@ class RoutingApp:
             return result.values()
 
 
-# ==========================================================
-# PATH FINDER
-# ==========================================================
+
 def find_best_path(app, source, target):
     result = app.generate_possible_combinations(int(source), int(target))
     if not result:
@@ -236,9 +221,6 @@ def find_best_path(app, source, target):
     return min(paths, key=lambda x: x['cost']) if paths else None
 
 
-# ==========================================================
-# MAP CREATION
-# ==========================================================
 def create_comparison_map(baseline_path, closure_path, closed_coords,
                           scenario_name, output_file):
     """Create map with both routes + closed roads."""
@@ -293,9 +275,6 @@ def create_comparison_map(baseline_path, closure_path, closed_coords,
     m.save(output_file)
     return output_file
 
-# ==========================================================
-# MAIN
-# ==========================================================
 def main(args=None):
     parser = argparse.ArgumentParser(
         description='Shortest distance routing — non-closure vs closure comparison'
