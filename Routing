@@ -1,0 +1,446 @@
+from neo4j import GraphDatabase
+import folium as fo
+import argparse
+import pandas as pd
+import webbrowser
+import os
+
+
+class RoutingApp:
+    def __init__(self, uri, user, password):
+        self.driver = GraphDatabase.driver(uri, auth=(user, password))
+
+    def close(self):
+        self.driver.close()
+
+    def _safe_drop_graph(self, session, graph_name):
+        try:
+            result = session.run(f"CALL gds.graph.drop('{graph_name}')")
+            result.consume()
+        except Exception:
+            pass
+
+    # ==========================================================
+    # GRAPH PROJECTION — primal graph, distance weighted
+    # ==========================================================
+    def create_projected_graph(self):
+        """
+        Primal graph projection for Dijkstra routing.
+        Excludes closed routes (temp_status IS NULL).
+        """
+        with self.driver.session() as session:
+            self._safe_drop_graph(session, 'graph')
+            result = session.run("""
+                CALL gds.graph.create.cypher(
+                    'graph',
+                    'MATCH (n:RoadJunction) RETURN id(n) AS id,
+                     n.lat AS lat, n.lon AS lon',
+                    'MATCH (n:RoadJunction)-[r:ROUTE]->(m:RoadJunction)
+                     WHERE r.status = "active"
+                       AND r.temp_status IS NULL
+                     RETURN id(n) AS source, id(m) AS target,
+                            r.distance AS distance'
+                )
+            """)
+            result.consume()
+
+            proj_info = session.run("""
+                CALL gds.graph.list()
+                YIELD graphName, relationshipCount
+                RETURN graphName, relationshipCount
+            """).single()
+            print(f"    Projection '{proj_info['graphName']}' — "
+                  f"{proj_info['relationshipCount']} relationships")
+
+    def delete_projected_graph(self):
+        with self.driver.session() as session:
+            self._safe_drop_graph(session, 'graph')
+
+    # ==========================================================
+    # PAGERANK — dual graph, unweighted
+    # ==========================================================
+    def get_pagerank_roads(self):
+        """Rank roads by PageRank on dual graph."""
+        with self.driver.session() as session:
+            self._safe_drop_graph(session, 'dual_pr')
+            session.run("""
+                CALL gds.graph.create.cypher(
+                    'dual_pr',
+                    'MATCH (n:RoadOsm)
+                     WHERE n.status = "active"
+                     RETURN id(n) AS id',
+                    'MATCH (n:RoadOsm)-[:CONNECTED]->(m:RoadOsm)
+                     WHERE n.status = "active" AND m.status = "active"
+                     RETURN id(n) AS source, id(m) AS target'
+                )
+            """).consume()
+
+            result = session.run("""
+                CALL gds.pageRank.stream('dual_pr', {
+                    dampingFactor: 0.85
+                })
+                YIELD nodeId, score
+                RETURN gds.util.asNode(nodeId).name AS road_name,
+                       score AS pagerank
+                ORDER BY score DESC
+            """)
+            df = pd.DataFrame([dict(r) for r in result])
+            self._safe_drop_graph(session, 'dual_pr')
+            return df
+
+    # ==========================================================
+    # ROAD CLOSURE — on ROUTE relationships (primal graph)
+    # ==========================================================
+    def close_roads(self, road_names):
+        """Close roads by setting temp_status on ROUTE relationships."""
+        if not road_names:
+            return 0
+        with self.driver.session() as session:
+            result = session.run("""
+                UNWIND $roads AS road_name
+                MATCH (a:RoadJunction)-[r:ROUTE]->(b:RoadJunction)
+                WHERE r.name = road_name AND r.status = 'active'
+                SET r.temp_status = 'closed'
+                RETURN count(r) AS closed_count
+            """, roads=road_names).single()['closed_count']
+            return result
+
+    def restore_roads(self):
+        """Remove ALL temp_status markers from ROUTE relationships."""
+        with self.driver.session() as session:
+            session.run("""
+                MATCH (a:RoadJunction)-[r:ROUTE]->(b:RoadJunction)
+                WHERE r.temp_status IS NOT NULL
+                REMOVE r.temp_status
+            """).consume()
+
+    # ==========================================================
+    # ROAD COORDINATES — for map visualization
+    # ==========================================================
+    def get_road_coordinates(self, road_names):
+        if not road_names:
+            return []
+        with self.driver.session() as session:
+            result = session.run("""
+                UNWIND $roads AS road_name
+                MATCH (a:RoadJunction)-[r:ROUTE]->(b:RoadJunction)
+                WHERE r.name = road_name AND r.status = 'active'
+                RETURN r.name AS road_name,
+                       a.lat AS src_lat, a.lon AS src_lon,
+                       b.lat AS tgt_lat, b.lon AS tgt_lon
+            """, roads=road_names)
+            return [dict(r) for r in result]
+
+    # ==========================================================
+    # POI COMBINATIONS — FIX: temp_status check added
+    # ==========================================================
+    def generate_possible_combinations(self, source, target):
+        """
+        Find nearest junctions to source/target POIs.
+        FIX: Now checks temp_status IS NULL on ROUTE relationships
+        so closed roads are excluded from candidate junctions.
+        """
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (p:OSMWay{osm_id: $source})<-[:PART_OF]-(osmn:OSMNode)
+                      -[r:NEAR]->(wns:RoadJunction)
+                MATCH (wns)-[rt1:ROUTE]->(next1:RoadJunction)
+                WHERE rt1.status = 'active' AND rt1.temp_status IS NULL
+
+                MATCH (p1:OSMWay{osm_id: $target})<-[:PART_OF]-(osmn2:OSMNode)
+                      -[rt:NEAR]->(wnt:RoadJunction)
+                MATCH (prev1:RoadJunction)-[rt2:ROUTE]->(wnt)
+                WHERE rt2.status = 'active' AND rt2.temp_status IS NULL
+
+                RETURN distinct p.osm_id  AS POI_source,
+                               p1.osm_id AS POI_target,
+                               r.distance  AS distance_source,
+                               wns.osmnode_id AS junction_source,
+                               rt.distance AS distance_target,
+                               wnt.osmnode_id AS junction_target
+                ORDER BY distance_source, distance_target
+            """, source=source, target=target)
+            return result.values()
+
+    # ==========================================================
+    # SHORTEST PATH — Dijkstra by distance
+    # ==========================================================
+    def read_distance_path(self, source, target):
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (sWn:RoadJunction {osmnode_id: $source})
+                MATCH (tWn:RoadJunction {osmnode_id: $target})
+                CALL gds.shortestPath.dijkstra.stream('graph', {
+                    sourceNode: id(sWn),
+                    targetNode: id(tWn),
+                    relationshipWeightProperty: 'distance'
+                })
+                YIELD sourceNode, targetNode, totalCost, nodeIds
+                WITH sourceNode, targetNode, totalCost, nodeIds,
+                     [nodeId IN nodeIds |
+                      [gds.util.asNode(nodeId).lat,
+                       gds.util.asNode(nodeId).lon]] AS cords
+                UNWIND range(0, size(nodeIds)-2) AS idx
+                WITH sourceNode, targetNode, totalCost, cords, nodeIds,
+                     gds.util.asNode(nodeIds[idx])   AS n1,
+                     gds.util.asNode(nodeIds[idx+1]) AS n2
+                MATCH (n1)-[r:ROUTE]->(n2)
+                WHERE r.temp_status IS NULL
+                WITH sourceNode, targetNode, totalCost, cords,
+                     sum(r.distance) AS total_distance,
+                     count(r)        AS hops
+                RETURN sourceNode AS source,
+                       targetNode AS target,
+                       totalCost  AS total_cost,
+                       cords, total_distance, hops
+            """, source=source, target=target)
+            return result.values()
+
+
+# ==========================================================
+# PATH FINDER
+# ==========================================================
+def find_best_path(app, source, target):
+    result = app.generate_possible_combinations(int(source), int(target))
+    if not result:
+        return None
+
+    df = pd.DataFrame(result, columns=[
+        'POI_source', 'POI_target', 'distance_source',
+        'junction_source', 'distance_target', 'junction_target'
+    ])
+
+    mn_s = df['distance_source'].min()
+    mx_s = df['distance_source'].max()
+    mn_t = df['distance_target'].min()
+    mx_t = df['distance_target'].max()
+    df['ds_norm'] = (df['distance_source'] - mn_s) / (mx_s - mn_s) \
+                    if mx_s != mn_s else 0
+    df['dt_norm'] = (df['distance_target'] - mn_t) / (mx_t - mn_t) \
+                    if mx_t != mn_t else 0
+    df['sum_dist'] = df['ds_norm'] + df['dt_norm']
+
+    paths = []
+    for _, row in df[df.sum_dist < 0.1].sort_values('sum_dist').iterrows():
+        res = app.read_distance_path(
+            str(row.junction_source), str(row.junction_target)
+        )
+        if res:
+            paths.append({
+                'cost':           res[0][2],
+                'path':           res[0][3],
+                'total_distance': res[0][4],
+                'hops':           res[0][5],
+            })
+
+    return min(paths, key=lambda x: x['cost']) if paths else None
+
+
+# ==========================================================
+# MAP CREATION
+# ==========================================================
+def create_comparison_map(baseline_path, closure_path, closed_coords,
+                          scenario_name, output_file):
+    """Create map with both routes + closed roads."""
+    center = baseline_path['path'][0] if baseline_path else closure_path['path'][0]
+    m = fo.Map(location=center, zoom_start=14)
+
+    # Closed roads (gray)
+    for r in closed_coords:
+        fo.PolyLine(
+            [[r['src_lat'], r['src_lon']], [r['tgt_lat'], r['tgt_lon']]],
+            color='orange', weight=3, opacity=0.8,
+            popup=f"CLOSED: {r['road_name']}"
+        ).add_to(m)
+
+    # Baseline route (green)
+    if baseline_path:
+        fo.PolyLine(baseline_path['path'], color='green', weight=5,
+                    opacity=0.8, popup='Non-closure route').add_to(m)
+
+    # Closure route (red)
+    if closure_path:
+        fo.PolyLine(closure_path['path'], color='red', weight=5,
+                    opacity=0.8, popup=f'{scenario_name} route').add_to(m)
+
+    # Markers
+    if baseline_path:
+        fo.Marker(baseline_path['path'][0], popup='Source',
+                  icon=fo.Icon(color='blue')).add_to(m)
+        fo.Marker(baseline_path['path'][-1], popup='Destination',
+                  icon=fo.Icon(color='black')).add_to(m)
+
+    # Legend
+    bl_dist = f"{baseline_path['total_distance']:.0f}" if baseline_path else "N/A"
+    cl_dist = f"{closure_path['total_distance']:.0f}" if closure_path else "N/A"
+    #bl_hops = baseline_path['hops'] if baseline_path else "N/A"
+    #cl_hops = closure_path['hops'] if closure_path else "N/A"
+
+    legend = f'''
+    <div style="position:fixed;top:10px;right:10px;width:250px;
+                background:white;border:2px solid grey;z-index:9999;
+                font-size:13px;padding:10px;font-family:monospace;">
+    <b>ROUTE COMPARISON</b><br><br>
+    <span style="color:green;">■</span> Non-closure<br>
+    &nbsp; Distance: {bl_dist} m<br><br>
+    <span style="color:red;">■</span> {scenario_name}<br>
+    &nbsp; Distance: {cl_dist} m<br><br>
+    <span style="color:orange;">■</span> Closed roads
+    </div>
+    '''
+    m.get_root().html.add_child(fo.Element(legend))
+
+    m.save(output_file)
+    return output_file
+
+# ==========================================================
+# MAIN
+# ==========================================================
+def main(args=None):
+    parser = argparse.ArgumentParser(
+        description='Shortest distance routing — non-closure vs closure comparison'
+    )
+    parser.add_argument('--source', '-s', required=True, help='Source POI OSM ID')
+    parser.add_argument('--destination', '-d', required=True, help='Destination POI OSM ID')
+    parser.add_argument('--neo4jURL', '-n', required=True)
+    parser.add_argument('--neo4juser', '-u', required=True)
+    parser.add_argument('--neo4jpwd', '-p', required=True)
+    parser.add_argument('--output', '-o', default='routing_results')
+    args = parser.parse_args(args=args)
+
+    os.makedirs(args.output, exist_ok=True)
+
+    print(f"\n{'='*60}")
+    print("SHORTEST DISTANCE ROUTING — NON-CLOSURE vs CLOSURE")
+    print(f"{'='*60}")
+    print(f"  Source:      {args.source}")
+    print(f"  Destination: {args.destination}")
+    print(f"{'='*60}")
+
+    app = RoutingApp(args.neo4jURL, args.neo4juser, args.neo4jpwd)
+
+    # ---- Step 1: PageRank ----
+    print("\n  Step 1: Calculating PageRank...")
+    pr_df = app.get_pagerank_roads()
+    print(f"    ✓ {len(pr_df)} roads ranked")
+
+    # ---- Step 2: NON-CLOSURE routing ----
+    print("\n  Step 2: Non-closure routing...")
+    app.restore_roads()  # ensure clean state
+    app.create_projected_graph()
+
+    baseline_path = find_best_path(app, args.source, args.destination)
+    app.delete_projected_graph()
+
+    if baseline_path:
+        print(f"    ✓ Distance: {baseline_path['total_distance']:.2f} m, "
+              f"Hops: {baseline_path['hops']}")
+    else:
+        print("    ⚠ No path found!")
+
+    # ---- Step 3: Ask user for closure percentage ----
+    pct = float(input(
+        '\nEnter % of top PageRank roads to close (0 = skip closure): '
+    ))
+
+    if pct > 0:
+        n_close = int(len(pr_df) * pct / 100)
+        closed_roads = pr_df.head(n_close)['road_name'].tolist()
+        scenario_name = f"Close top {pct}%"
+
+        print(f"\n  Step 3: Closing {n_close} roads ({pct}% of {len(pr_df)})...")
+        for r in closed_roads[:5]:
+            print(f"    - {r}")
+        if len(closed_roads) > 5:
+            print(f"    ... and {len(closed_roads) - 5} more")
+
+        closed_count = app.close_roads(closed_roads)
+        print(f"    ✓ {closed_count} route segments closed")
+
+        app.create_projected_graph()
+
+        closure_path = find_best_path(app, args.source, args.destination)
+        app.delete_projected_graph()
+
+        if closure_path:
+            print(f"    ✓ Distance: {closure_path['total_distance']:.2f} m, "
+                  f"Hops: {closure_path['hops']}")
+        else:
+            print("    ⚠ No path found after closure!")
+
+        # ---- Step 4: Comparison ----
+        print(f"\n  Step 4: Creating comparison map...")
+
+        closed_coords = app.get_road_coordinates(closed_roads)
+
+        map_file = os.path.join(
+            args.output,
+            f"route_comparison_top{int(pct)}pct.html"
+        )
+        create_comparison_map(
+            baseline_path, closure_path, closed_coords,
+            scenario_name, map_file
+        )
+        print(f"    ✓ {map_file}")
+
+        # ---- Step 5: Stats comparison ----
+        print(f"\n{'='*60}")
+        print("COMPARISON")
+        print(f"{'='*60}")
+        if baseline_path and closure_path:
+            dist_diff = closure_path['total_distance'] - baseline_path['total_distance']
+            dist_pct = (dist_diff / baseline_path['total_distance']) * 100
+            print(f"  {'Metric':<25} {'Non-closure':>12} {'Closure':>12} {'Change':>12}")
+            print(f"  {'-'*61}")
+            print(f"  {'Distance (m)':<25} {baseline_path['total_distance']:>12.2f} "
+                  f"{closure_path['total_distance']:>12.2f} {dist_diff:>+12.2f}")
+            print(f"  {'Hops':<25} {baseline_path['hops']:>12} "
+                  f"{closure_path['hops']:>12} "
+                  f"{closure_path['hops'] - baseline_path['hops']:>+12}")
+            print(f"  {'Distance increase':<25} {'':>12} {'':>12} {dist_pct:>+11.1f}%")
+        elif baseline_path:
+            print(f"  Non-closure: {baseline_path['total_distance']:.2f} m")
+            print(f"  Closure: NO PATH FOUND — network fragmented")
+        print(f"{'='*60}")
+
+        # Cleanup
+        print("\n  Restoring roads...")
+        app.restore_roads()
+        print("  ✓ All roads restored")
+
+        # Open map
+        webbrowser.open("file://" + os.path.abspath(map_file), new=2)
+
+    else:
+        # No closure — just show baseline result
+        print("\n  No closure requested. Baseline route only.")
+        if baseline_path:
+            # Save baseline-only map
+            map_file = os.path.join(args.output, "route_non_closure.html")
+            m = fo.Map(location=baseline_path['path'][0], zoom_start=14)
+            fo.PolyLine(baseline_path['path'], color='green', weight=5,
+                        opacity=0.8).add_to(m)
+            fo.Marker(baseline_path['path'][0], popup='Source',
+                      icon=fo.Icon(color='blue')).add_to(m)
+            fo.Marker(baseline_path['path'][-1], popup='Destination',
+                      icon=fo.Icon(color='black')).add_to(m)
+            m.get_root().html.add_child(fo.Element(f'''
+                <div style="position:fixed;top:10px;right:10px;width:220px;
+                            background:white;border:2px solid grey;z-index:9999;
+                            font-size:13px;padding:10px;font-family:monospace;">
+                <b>NON-CLOSURE ROUTE</b><br>
+                Distance: {baseline_path['total_distance']:.0f} m<br>
+                Hops: {baseline_path['hops']}
+                </div>
+            '''))
+            m.save(map_file)
+            print(f"    ✓ {map_file}")
+            webbrowser.open("file://" + os.path.abspath(map_file), new=2)
+
+    app.close()
+    print(f"\n  ✅ Done\n")
+    return 0
+
+
+if __name__ == '__main__':
+    main()
