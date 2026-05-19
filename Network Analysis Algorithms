@@ -14,9 +14,6 @@ import warnings
 warnings.filterwarnings("ignore")
 
 
-# ============================================================
-# PLOT STYLE
-# ============================================================
 def setup_plot_style():
     plt.rcParams.update({
         "font.family": "serif",
@@ -37,9 +34,6 @@ def setup_plot_style():
     })
 
 
-# ============================================================
-# ANALYZER
-# ============================================================
 class DualGraphAnalyzer:
     def __init__(self, uri, user, password):
         self.driver = GraphDatabase.driver(uri, auth=(user, password))
@@ -47,9 +41,6 @@ class DualGraphAnalyzer:
     def close(self):
         self.driver.close()
 
-    # ----------------------------------------------------------
-    # GDS PROJECTIONS (TWO: directed + undirected)
-    # ----------------------------------------------------------
     def create_directed_projection(self, graph_name="dual-directed"):
         """
         Directed dual graph for: PageRank, Betweenness, Harmonic Closeness,
@@ -112,9 +103,6 @@ class DualGraphAnalyzer:
             except Exception:
                 pass
 
-    # ==========================================================
-    # 1. DEGREE — undirected count of distinct neighbors
-    # ==========================================================
     def calculate_degree(self):
         """
         Paper §3.1: degree of a road node = how many other roads
@@ -136,9 +124,6 @@ class DualGraphAnalyzer:
               f"max_k={df['degree'].max()}, min_k={df['degree'].min()}")
         return df
 
-    # ==========================================================
-    # 2. BETWEENNESS CENTRALITY — Brandes algorithm (GDS)
-    # ==========================================================
     def calculate_betweenness(self, graph_name="dual-directed"):
         """
         Paper §3.2:  C_B(v) = Σ σ_st(v) / σ_st  (raw)
@@ -173,9 +158,6 @@ class DualGraphAnalyzer:
               f"mean={df['betweenness_norm'].mean():.6f}")
         return df
 
-    # ==========================================================
-    # 3. PAGERANK — d=0.85 (GDS)
-    # ==========================================================
     def calculate_pagerank(self, graph_name="dual-directed"):
         """Paper §3.3:  PR(v) = (1-d) + d Σ PR(u)/L(u),  d=0.85"""
         print("\n  [3/12] PageRank (d=0.85)...")
@@ -195,9 +177,6 @@ class DualGraphAnalyzer:
               f"mean={df['pagerank'].mean():.4f}")
         return df
 
-    # ==========================================================
-    # 4. HARMONIC CLOSENESS — GDS
-    # ==========================================================
     def calculate_harmonic_closeness(self, graph_name="dual-directed"):
         """Paper §3.4:  C_H(v) = (1/(N-1)) Σ 1/d(v,u)"""
         print("\n  [4/12] Harmonic closeness...")
@@ -215,9 +194,6 @@ class DualGraphAnalyzer:
               f"mean={df['harmonic_closeness'].mean():.4f}")
         return df
 
-    # ==========================================================
-    # 5a. STANDARD CLUSTERING — UNDIRECTED projection
-    # ==========================================================
     def calculate_clustering_gds(self, graph_name="dual-undirected"):
         """
         Paper §3.5 (standard, undirected formula):
@@ -253,9 +229,7 @@ class DualGraphAnalyzer:
               f"mean={df['clustering_coeff'].mean():.4f}")
         return df
 
-    # ==========================================================
-    # 5b. ADAPTED CLUSTERING — DIRECTED graph
-    # ==========================================================
+
     def calculate_adapted_clustering(self):
         """
         Paper §3.5 (adapted for directed):
@@ -329,9 +303,7 @@ class DualGraphAnalyzer:
               f"mean={df['adapted_clustering'].mean():.4f}")
         return df
 
-    # ==========================================================
-    # 6. CONNECTED COMPONENTS — BOTH WCC and SCC
-    # ==========================================================
+
     def calculate_components(self, graph_name="dual-directed"):
         """
         Paper §3.9: connected components.
@@ -391,9 +363,7 @@ class DualGraphAnalyzer:
               f"SCC count = {info['scc_count']}")
         return info
 
-    # ==========================================================
-    # 7. LOUVAIN COMMUNITIES — UNDIRECTED projection
-    # ==========================================================
+
     def calculate_communities(self, graph_name="dual-undirected"):
         """
         Paper §3.10:  Q = (1/2m) Σ [A_ij - k_i k_j/2m] δ(c_i,c_j)
@@ -427,9 +397,7 @@ class DualGraphAnalyzer:
               f"Q={mod_info['modularity']:.4f}")
         return comm_df, mod_info
 
-    # ==========================================================
-    # 8. AVG PATH LENGTH — DIRECTED traversal
-    # ==========================================================
+
     def calculate_avg_path_length(self, sample_size=6000):
         """
         Paper §3.6:  ℓ = (1/(N(N-1))) Σ d(i,j)
@@ -491,9 +459,7 @@ class DualGraphAnalyzer:
                 print("       ⚠ Could not compute (graph may be disconnected)")
         return info
 
-    # ==========================================================
-    # 9. DIAMETER — value comes from path length sampling
-    # ==========================================================
+
     def calculate_diameter(self):
         """
         Paper §3.7:  D = max d(i,j)
@@ -506,9 +472,7 @@ class DualGraphAnalyzer:
         print("       (value from path-length sampling step)")
         return None
 
-    # ==========================================================
-    # 10. GLOBAL ASSORTATIVITY — Newman's r
-    # ==========================================================
+
     def calculate_global_assortativity(self, degree_df=None):
         """
         Paper §3.8:
@@ -559,9 +523,7 @@ class DualGraphAnalyzer:
         print(f"       r = {r:.6f}  ({'Assortative' if r > 0 else 'Disassortative'})")
         return {"assortativity_r": r, "edge_count": M}
 
-    # ==========================================================
-    # RANDOM PATH METRICS
-    # ==========================================================
+
     def calculate_random_path_metrics(self):
         """
         Random path average length + average cost.
@@ -623,9 +585,7 @@ class DualGraphAnalyzer:
         print(f"       avg length = {avg_length}, avg cost = {avg_cost}")
         return info
 
-    # ==========================================================
-    # 11. ASSORTATIVITY SPECTRUM  k_nn(k)
-    # ==========================================================
+
     def calculate_assortativity_spectrum(self):
         """
         k_nn(k) = average degree of neighbors of nodes with degree k.
@@ -658,9 +618,6 @@ class DualGraphAnalyzer:
         print(f"       degree levels = {len(df)}")
         return df
 
-    # ==========================================================
-    # CONDUCTANCE PER COMMUNITY
-    # ==========================================================
     def calculate_conductance(self, community_df):
         """
         Edge-ratio conductance per community:
@@ -721,9 +678,7 @@ class DualGraphAnalyzer:
                   f"min={cond_df['conductance'].min():.4f}")
         return cond_df
 
-    # ==========================================================
-    # STORE METRICS — UNWIND batch (fast)
-    # ==========================================================
+
     def store_metrics(self, df):
         """Store computed metrics back to Neo4j as node properties."""
         print("\n  Storing metrics on nodes (UNWIND batch)...")
@@ -759,9 +714,7 @@ class DualGraphAnalyzer:
         print(f"       ✓ Stored {len(available)} metrics on {len(rows)} nodes")
 
 
-# ============================================================
-# DEGREE DISTRIBUTION HELPERS
-# ============================================================
+
 def compute_pk(degree_series):
     counts = degree_series.value_counts().sort_index()
     total = len(degree_series)
@@ -831,9 +784,6 @@ def compute_adapted_clustering_spectrum(node_df):
     return grouped
 
 
-# ============================================================
-# PLOTS
-# ============================================================
 def create_all_plots(node_df, pk_df, power_law, clustering_spectrum_df,
                      adapted_spectrum_df, assortativity_df, community_df,
                      output_dir):
@@ -1079,9 +1029,6 @@ def create_all_plots(node_df, pk_df, power_law, clustering_spectrum_df,
     print("   ✓ All visualisations done")
 
 
-# ============================================================
-# MAIN
-# ============================================================
 def main():
     parser = argparse.ArgumentParser(
         description="Dual Graph Complete Analysis (formula-correct)"
