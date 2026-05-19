@@ -1,0 +1,521 @@
+import argparse
+import os
+import time
+import pandas as pd
+import networkx as nx
+from typing import List, Tuple, Dict, Set
+from collections import defaultdict
+import numpy as np
+
+
+class DualGraphGenerator:
+    def __init__(self, nodes_csv: str, rels_csv: str, output_folder: str):
+        self.nodes_csv = nodes_csv
+        self.rels_csv = rels_csv
+        self.output_folder = output_folder
+        self.G = None
+        self.roadosm_nodes = []
+        self.connected_edges = []
+
+        if not os.path.exists(self.output_folder):
+            os.makedirs(self.output_folder)
+
+    def _infer_neo4j_type(self, value):
+        """Infer Neo4j data type from a Python value"""
+        if value is None:
+            return "STRING"
+        if isinstance(value, bool):
+            return "BOOLEAN"
+        if isinstance(value, (int, np.integer)):
+            return "INT"
+        if isinstance(value, (float, np.floating)):
+            return "FLOAT"
+        return "STRING"
+
+    # Fields that should remain numeric in neo4j-admin import
+    NUMERIC_DOUBLE_FIELDS = {'lat', 'lon', 'x', 'y', 'distance', 'length'}
+    NUMERIC_LONG_FIELDS = {'street_count'}
+
+    def _build_neo4j_header(self, df: pd.DataFrame, id_col: str = None, id_space: str = None,
+                            start_id_col: str = None, end_id_col: str = None,
+                            start_id_space: str = None, end_id_space: str = None) -> List[str]:
+        """Build neo4j-admin import compatible header from DataFrame columns"""
+        headers = []
+        for col in df.columns:
+            if id_col and col == id_col:
+                if id_space:
+                    headers.append(f'id:ID({id_space})')
+                else:
+                    headers.append('id:ID')
+            elif start_id_col and col == start_id_col:
+                if start_id_space:
+                    headers.append(f':START_ID({start_id_space})')
+                else:
+                    headers.append(':START_ID')
+            elif end_id_col and col == end_id_col:
+                if end_id_space:
+                    headers.append(f':END_ID({end_id_space})')
+                else:
+                    headers.append(':END_ID')
+            elif col == 'edge_type':
+                headers.append(':TYPE')
+            elif col in self.NUMERIC_DOUBLE_FIELDS:
+                headers.append(f"{col}:DOUBLE")
+            elif col in self.NUMERIC_LONG_FIELDS:
+                headers.append(f"{col}:LONG")
+            else:
+                headers.append(f"{col}:STRING")
+        return headers
+
+    def _save_csv_with_neo4j_headers(self, df: pd.DataFrame, filepath: str,
+                                      id_col: str = None, id_space: str = None,
+                                      start_id_col: str = None, end_id_col: str = None,
+                                      start_id_space: str = None, end_id_space: str = None):
+        """Save DataFrame as CSV with neo4j-admin import headers"""
+        headers = self._build_neo4j_header(df, id_col=id_col, id_space=id_space,
+                                            start_id_col=start_id_col, end_id_col=end_id_col,
+                                            start_id_space=start_id_space, end_id_space=end_id_space)
+        with open(filepath, 'w', newline='') as f:
+            f.write(','.join(headers) + '\n')
+        df.to_csv(filepath, mode='a', index=False, header=False)
+
+    def load_primal_graph(self):
+        """Load the primal graph from CSV files into NetworkX"""
+        print("Loading primal graph from CSV files...")
+
+        nodes_df = pd.read_csv(self.nodes_csv)
+        print(f"Loaded {len(nodes_df)} nodes")
+
+        rels_df = pd.read_csv(self.rels_csv)
+        print(f"Loaded {len(rels_df)} edges")
+
+        self.G = nx.MultiDiGraph()
+
+        # Add nodes with all properties
+        for _, row in nodes_df.iterrows():
+            node_id = row['osmnode_id']
+            node_attrs = {}
+            for col in nodes_df.columns:
+                if col != 'osmnode_id':
+                    node_attrs[col] = row.get(col)
+            self.G.add_node(node_id, **node_attrs)
+
+        # Add edges with all properties
+        for _, row in rels_df.iterrows():
+            edge_attrs = {}
+            for col in rels_df.columns:
+                if col not in ('source_id', 'target_id'):
+                    edge_attrs[col] = row.get(col)
+            self.G.add_edge(row['source_id'], row['target_id'], **edge_attrs)
+
+        print(f"Primal graph loaded: {self.G.number_of_nodes()} nodes, {self.G.number_of_edges()} edges")
+
+    def create_roadosm_nodes(self):
+        """
+        Step 1 & 2 from Code 5:
+        - Create RoadOsm nodes from DISTINCT r.name where r.name IS NOT NULL and status='active'
+        - Set distance = sum(r.distance), osmway_ids = collect(DISTINCT r.osmway_id)
+        """
+        print("\nStep 1: Creating RoadOsm nodes based on road names...")
+
+        road_data = defaultdict(lambda: {
+            'osmway_ids': set(),
+            'total_distance': 0.0,
+        })
+
+        for u, v, k, data in self.G.edges(keys=True, data=True):
+            status = data.get('status')
+            name = data.get('name')
+
+            if status != 'active' or name is None or (isinstance(name, float) and np.isnan(name)):
+                continue
+
+            # No semicolon splitting - treat name as-is, exactly like Code 5
+            road_name = str(name)
+            if not road_name or road_name == 'nan':
+                continue
+
+            road_data[road_name]['osmway_ids'].add(str(data.get('osmway_id', '')))
+            distance = data.get('distance') or data.get('length') or 0
+            if isinstance(distance, (int, float)) and not np.isnan(distance):
+                road_data[road_name]['total_distance'] += distance
+
+        for road_name, info in road_data.items():
+            node = {
+                'id': road_name,
+                'name': road_name,
+                'node_type': 'RoadOsm',
+                'status': 'active',
+                'distance': info['total_distance'],
+                'osmway_ids': ';'.join(info['osmway_ids']),
+            }
+            self.roadosm_nodes.append(node)
+
+        print(f"? Created {len(self.roadosm_nodes)} RoadOsm nodes based on road names")
+
+    def create_connected_relationships(self):
+        """
+        Step 3 from Code 5 - exact same directional pattern:
+
+        MATCH (m:RoadJunction)-[r:ROUTE {status:'active'}]->(n:RoadJunction)
+        WHERE r.name IS NOT NULL
+        WITH DISTINCT r.name as street_name
+        UNWIND street_name as sname
+        MATCH (m:RoadJunction)-[r1:ROUTE {status:'active'}]->(n:RoadJunction)
+        WHERE r1.name = sname
+        WITH m, sname
+        MATCH (x:RoadJunction)-[r2:ROUTE {status:'active'}]->(m:RoadJunction)
+        WHERE r2.name IS NOT NULL AND r2.name <> sname
+
+        Meaning: For each named road 'sname', find junction m where an outgoing edge
+        has name=sname, and an incoming edge from x has a DIFFERENT name.
+        Then connect source=r2.name -> target=sname
+
+        Optimized: Pre-build index of outgoing/incoming road names per junction,
+        then iterate junctions once instead of edges * roads.
+        """
+        print("\nStep 3: Creating CONNECTED relationships based on road names...")
+
+        valid_roads = set(n['id'] for n in self.roadosm_nodes)
+
+        # Pre-build: for each junction m, collect outgoing and incoming road names
+        # outgoing_roads[m] = set of road names where m -[name]-> n
+        # incoming_roads[m] = set of road names where x -[name]-> m
+        outgoing_roads = defaultdict(set)
+        incoming_roads = defaultdict(set)
+
+        for u, v, k, data in self.G.edges(keys=True, data=True):
+            if data.get('status') != 'active':
+                continue
+            name = data.get('name')
+            if name is None or (isinstance(name, float) and np.isnan(name)):
+                continue
+            name = str(name)
+            if name not in valid_roads:
+                continue
+            outgoing_roads[u].add(name)
+            incoming_roads[v].add(name)
+
+        print(f"  Built index: {len(outgoing_roads)} junctions with outgoing roads, "
+              f"{len(incoming_roads)} junctions with incoming roads")
+
+        # For each junction m: if m has outgoing road 'sname' AND incoming road 'other_name',
+        # then connect other_name -> sname
+        connection_data = defaultdict(lambda: {
+            'junction_ids': set(),
+            'locations': set()
+        })
+
+        for m in set(outgoing_roads.keys()) & set(incoming_roads.keys()):
+            out_names = outgoing_roads[m]
+            in_names = incoming_roads[m]
+
+            junction_data = self.G.nodes.get(m, {})
+            junction_location = junction_data.get('location', '')
+
+            for sname in out_names:
+                for incoming_name in in_names:
+                    if incoming_name == sname:
+                        continue
+                    key = (incoming_name, sname)
+                    connection_data[key]['junction_ids'].add(str(m))
+                    if junction_location and not (isinstance(junction_location, float) and np.isnan(junction_location)):
+                        connection_data[key]['locations'].add(str(junction_location))
+
+        for (source, target), info in connection_data.items():
+            edge = {
+                'source_id': source,
+                'target_id': target,
+                'junctions': ';'.join(info['junction_ids']),
+                'locations': ';'.join(info['locations']),
+                'edge_type': 'CONNECTED',
+                'via': ''
+            }
+            self.connected_edges.append(edge)
+
+        print(f"? Created {len(self.connected_edges)} CONNECTED relationships between RoadOsm nodes")
+
+    def create_roundabout_connections(self):
+        """
+        Step 4 from Code 5 - exact same logic:
+
+        MATCH (x)-[r1:ROUTE {status:'active'}]->(rbNode)
+        WHERE r1.name IS NOT NULL AND r1.junction IS NULL
+        MATCH (rbNode)-[:ROUTE*1..30 {junction:'roundabout', status:'active'}]->(rbNode2)
+        MATCH (rbNode2)-[r2:ROUTE {status:'active'}]->(y)
+        WHERE r2.name IS NOT NULL AND r2.junction IS NULL AND r1.name <> r2.name
+        MERGE (ro1)-[c1:CONNECTED]->(ro2)   -- both directions
+        MERGE (ro2)-[c2:CONNECTED]->(ro1)
+
+        Meaning: Find a named non-roundabout edge going INTO a roundabout node,
+        traverse 1-30 roundabout hops, then find a named non-roundabout edge going OUT,
+        and connect both directions.
+        """
+        print("\nStep 4: Connecting RoadOsm nodes through roundabouts...")
+
+        valid_roads = set(n['id'] for n in self.roadosm_nodes)
+        existing_connections = set((e['source_id'], e['target_id']) for e in self.connected_edges)
+
+        # Build roundabout subgraph (only roundabout edges with status='active')
+        rb_graph = nx.DiGraph()
+        for u, v, k, data in self.G.edges(keys=True, data=True):
+            if data.get('junction') == 'roundabout' and data.get('status') == 'active':
+                rb_graph.add_edge(u, v)
+
+        if rb_graph.number_of_nodes() == 0:
+            print("No roundabouts found")
+            return
+
+        roundabout_nodes = set(rb_graph.nodes())
+        print(f"Found {len(roundabout_nodes)} roundabout nodes")
+
+        # Find named non-roundabout edges going INTO roundabout nodes
+        # r1: x -[name, not roundabout]-> rbNode
+        incoming_roads = defaultdict(set)  # rbNode -> set of road names
+        for u, v, k, data in self.G.edges(keys=True, data=True):
+            if v in roundabout_nodes:
+                junction_val = data.get('junction')
+                is_roundabout = (junction_val == 'roundabout')
+                if (data.get('status') == 'active'
+                        and not is_roundabout
+                        and data.get('name') is not None
+                        and not (isinstance(data.get('name'), float) and np.isnan(data.get('name')))):
+                    name = str(data['name'])
+                    if name in valid_roads:
+                        incoming_roads[v].add(name)
+
+        # Find named non-roundabout edges going OUT of roundabout nodes
+        # r2: rbNode2 -[name, not roundabout]-> y
+        outgoing_roads = defaultdict(set)  # rbNode2 -> set of road names
+        for u, v, k, data in self.G.edges(keys=True, data=True):
+            if u in roundabout_nodes:
+                junction_val = data.get('junction')
+                is_roundabout = (junction_val == 'roundabout')
+                if (data.get('status') == 'active'
+                        and not is_roundabout
+                        and data.get('name') is not None
+                        and not (isinstance(data.get('name'), float) and np.isnan(data.get('name')))):
+                    name = str(data['name'])
+                    if name in valid_roads:
+                        outgoing_roads[u].add(name)
+
+        # For each roundabout entry node, BFS through roundabout edges (1-30 hops)
+        # and find all reachable roundabout exit nodes
+        roundabout_connections = 0
+        new_pairs = set()
+
+        for rb_entry_node, entry_roads in incoming_roads.items():
+            if rb_entry_node not in rb_graph:
+                continue
+
+            # BFS through roundabout edges, 1 to 30 hops
+            visited = set()
+            queue = [(rb_entry_node, 0)]
+
+            while queue:
+                current, depth = queue.pop(0)
+                if depth >= 5:
+                    continue
+                for neighbor in rb_graph.successors(current):
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append((neighbor, depth + 1))
+
+                        # Check if this reachable node has outgoing named non-roundabout edges
+                        exit_roads = outgoing_roads.get(neighbor, set())
+                        for road1 in entry_roads:
+                            for road2 in exit_roads:
+                                if road1 == road2:
+                                    continue
+                                # Both directions, exactly like Code 5's MERGE
+                                new_pairs.add((road1, road2))
+                                new_pairs.add((road2, road1))
+
+        for (source, target) in new_pairs:
+            if (source, target) not in existing_connections:
+                existing_connections.add((source, target))
+                edge = {
+                    'source_id': source,
+                    'target_id': target,
+                    'junctions': '',
+                    'locations': '',
+                    'edge_type': 'CONNECTED',
+                    'via': 'roundabout'
+                }
+                self.connected_edges.append(edge)
+                roundabout_connections += 1
+
+        print(f"? Connected RoadOsm nodes through roundabouts ({roundabout_connections} new connections)")
+
+    def create_unnamed_connections(self):
+        """
+        Step 5: Connect named roads through unnamed segments (1-500 hops)
+        Same logic as roundabout but for unnamed, non-roundabout edges.
+        """
+        print("\nStep 5: Connecting RoadOsm nodes through unnamed segments...")
+
+        valid_roads = set(n['id'] for n in self.roadosm_nodes)
+        existing_connections = set((e['source_id'], e['target_id']) for e in self.connected_edges)
+
+        # Build unnamed subgraph (only unnamed, non-roundabout, active edges)
+        unnamed_graph = nx.DiGraph()
+        for u, v, k, data in self.G.edges(keys=True, data=True):
+            if (data.get('status') == 'active'
+                    and (data.get('name') is None or (
+                            isinstance(data.get('name'), float) and np.isnan(data.get('name'))))
+                    and data.get('junction') != 'roundabout'):
+                unnamed_graph.add_edge(u, v)
+
+        if unnamed_graph.number_of_nodes() == 0:
+            print("No unnamed segments found")
+            return
+
+        unnamed_nodes = set(unnamed_graph.nodes())
+        print(f"Found {len(unnamed_nodes)} unnamed segment nodes")
+
+        # Named edges going INTO unnamed nodes
+        incoming_roads = defaultdict(set)
+        for u, v, k, data in self.G.edges(keys=True, data=True):
+            if v in unnamed_nodes:
+                if (data.get('status') == 'active'
+                        and data.get('junction') != 'roundabout'
+                        and data.get('name') is not None
+                        and not (isinstance(data.get('name'), float) and np.isnan(data.get('name')))):
+                    name = str(data['name'])
+                    if name in valid_roads:
+                        incoming_roads[v].add(name)
+
+        # Named edges going OUT of unnamed nodes
+        outgoing_roads = defaultdict(set)
+        for u, v, k, data in self.G.edges(keys=True, data=True):
+            if u in unnamed_nodes:
+                if (data.get('status') == 'active'
+                        and data.get('junction') != 'roundabout'
+                        and data.get('name') is not None
+                        and not (isinstance(data.get('name'), float) and np.isnan(data.get('name')))):
+                    name = str(data['name'])
+                    if name in valid_roads:
+                        outgoing_roads[u].add(name)
+
+        # BFS through unnamed edges, 1-500 hops
+        new_pairs = set()
+
+        for entry_node, entry_roads in incoming_roads.items():
+            if entry_node not in unnamed_graph:
+                continue
+
+            visited = set()
+            queue = [(entry_node, 0)]
+
+            while queue:
+                current, depth = queue.pop(0)
+                if depth >= 500:
+                    continue
+                for neighbor in unnamed_graph.successors(current):
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append((neighbor, depth + 1))
+
+                        exit_roads = outgoing_roads.get(neighbor, set())
+                        for road1 in entry_roads:
+                            for road2 in exit_roads:
+                                if road1 == road2:
+                                    continue
+                                new_pairs.add((road1, road2))
+                                new_pairs.add((road2, road1))
+
+        unnamed_connections = 0
+        for (source, target) in new_pairs:
+            if (source, target) not in existing_connections:
+                existing_connections.add((source, target))
+                edge = {
+                    'source_id': source,
+                    'target_id': target,
+                    'junctions': '',
+                    'locations': '',
+                    'edge_type': 'CONNECTED',
+                    'via': 'unnamed'
+                }
+                self.connected_edges.append(edge)
+                unnamed_connections += 1
+
+        print(f"? Connected RoadOsm nodes through unnamed segments ({unnamed_connections} new connections)")
+
+    def export_to_csv(self):
+        """Export dual graph nodes and edges to CSV files with neo4j-admin headers"""
+        print("\nExporting dual graph to CSV...")
+
+        if self.roadosm_nodes:
+            nodes_df = pd.DataFrame(self.roadosm_nodes)
+            nodes_file = os.path.join(self.output_folder, 'dual_nodes.csv')
+            self._save_csv_with_neo4j_headers(
+                nodes_df, nodes_file,
+                id_col='id', id_space='RoadOsm'
+            )
+            print(f"Exported {len(self.roadosm_nodes)} RoadOsm nodes to {nodes_file}")
+        else:
+            print("No RoadOsm nodes to export")
+
+        if self.connected_edges:
+            edges_df = pd.DataFrame(self.connected_edges)
+            edges_file = os.path.join(self.output_folder, 'dual_edges.csv')
+            self._save_csv_with_neo4j_headers(
+                edges_df, edges_file,
+                start_id_col='source_id', end_id_col='target_id',
+                start_id_space='RoadOsm', end_id_space='RoadOsm'
+            )
+            print(f"Exported {len(self.connected_edges)} CONNECTED edges to {edges_file}")
+        else:
+            print("No CONNECTED edges to export")
+
+    def generate_dual_graph(self):
+        """Main method to generate the dual graph"""
+        print("=== Dual Graph Generation (CSV-based) ===\n")
+
+        self.load_primal_graph()
+        self.create_roadosm_nodes()
+        self.create_connected_relationships()
+        self.create_roundabout_connections()
+        self.create_unnamed_connections()
+        self.export_to_csv()
+
+        print(f"\n=== Dual Graph Generation Completed ===")
+        print(f"RoadOsm nodes: {len(self.roadosm_nodes)}")
+        print(f"CONNECTED edges: {len(self.connected_edges)}")
+        print(f"Output folder: {self.output_folder}")
+
+
+def add_options():
+    parser = argparse.ArgumentParser(description='Creation of dual graph from primal graph CSV files.')
+    parser.add_argument('--nodes-csv', '-n', dest='nodes_csv', type=str, required=True,
+                        help='Path to fullgraph_nodes.csv')
+    parser.add_argument('--rels-csv', '-r', dest='rels_csv', type=str, required=True,
+                        help='Path to fullgraph_rels.csv')
+    parser.add_argument('--output', '-o', dest='output', type=str, required=True,
+                        help='Output folder for dual graph CSV files')
+    return parser
+
+
+def main(args=None):
+    start_time = time.time()
+    argParser = add_options()
+    options = argParser.parse_args(args=args)
+
+    generator = DualGraphGenerator(
+        nodes_csv=options.nodes_csv,
+        rels_csv=options.rels_csv,
+        output_folder=options.output
+    )
+
+    try:
+        generator.generate_dual_graph()
+    except Exception as e:
+        print(f"Error during dual graph generation: {e}")
+        raise
+
+    print(f"\nTotal execution time: {time.time() - start_time:.2f} seconds")
+    return 0
+
+
+if __name__ == "__main__":
+    main()
