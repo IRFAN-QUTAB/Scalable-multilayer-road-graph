@@ -88,7 +88,7 @@ python "Add POIs to Graph" -n fullgraph_nodes.csv -r fullgraph_rels.csv -o ./out
 
 ## 3. Creation of Dual Graph
 
-Transforms the primal junction graph into a dual (road-section) graph where each named road becomes a node (RoadOsm) and two roads sharing a junction are connected by a CONNECTED edge. Handles connections through roundabouts and unnamed road segments.
+Transforms the primal junction graph into a dual graph where each named road becomes a node (RoadOsm) and two roads sharing a junction are connected by a CONNECTED edge. Handles connections through roundabouts and unnamed road segments.
 
 ```shell
 python "Creation of Dual Graph" -n fullgraph_nodes.csv -r fullgraph_rels.csv -o ./output
