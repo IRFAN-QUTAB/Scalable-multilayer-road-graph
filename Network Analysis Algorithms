@@ -1,0 +1,1336 @@
+
+from neo4j import GraphDatabase
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+from scipy.stats import gaussian_kde, spearmanr
+import os
+import argparse
+from datetime import datetime
+import time
+import warnings
+
+warnings.filterwarnings("ignore")
+
+
+# ============================================================
+# PLOT STYLE
+# ============================================================
+def setup_plot_style():
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.size": 11,
+        "axes.labelsize": 12,
+        "axes.titlesize": 13,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "legend.fontsize": 10,
+        "figure.dpi": 300,
+        "savefig.dpi": 300,
+        "savefig.bbox": "tight",
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.grid": False,
+        "grid.alpha": 0.3,
+        "grid.linestyle": "--",
+    })
+
+
+# ============================================================
+# ANALYZER
+# ============================================================
+class DualGraphAnalyzer:
+    def __init__(self, uri, user, password):
+        self.driver = GraphDatabase.driver(uri, auth=(user, password))
+
+    def close(self):
+        self.driver.close()
+
+    # ----------------------------------------------------------
+    # GDS PROJECTIONS (TWO: directed + undirected)
+    # ----------------------------------------------------------
+    def create_directed_projection(self, graph_name="dual-directed"):
+        """
+        Directed dual graph for: PageRank, Betweenness, Harmonic Closeness,
+        Avg Path Length, Diameter, WCC, SCC.
+        These metrics either need direction or are direction-agnostic.
+        """
+        with self.driver.session() as session:
+            try:
+                session.run(f"CALL gds.graph.drop('{graph_name}', false)")
+            except Exception:
+                pass
+            session.run(f"""
+                CALL gds.graph.create.cypher(
+                    '{graph_name}',
+                    'MATCH (n:RoadOsm)
+                     WHERE n.status = "active"
+                     RETURN id(n) AS id',
+                    'MATCH (n:RoadOsm)-[:CONNECTED]->(m:RoadOsm)
+                     WHERE n.status = "active" AND m.status = "active"
+                     RETURN id(n) AS source, id(m) AS target'
+                )
+            """)
+        print(f"   ✓ Directed projection created: {graph_name}")
+
+    def create_undirected_projection(self, graph_name="dual-undirected"):
+        """
+        Projection for standard Clustering Coefficient and Louvain.
+
+        The underlying CONNECTED graph is already bidirectional
+        (Step 3, 4, 5 of dual_graph_creation.py create both
+        A→B and B→A). So we load ALL edges — GDS sees a symmetric
+        directed graph, which is mathematically equivalent to an
+        undirected graph for triangle counting and modularity.
+
+        We do NOT use id(n) < id(m) filter — that would drop half
+        the edges and change the community count.
+        """
+        with self.driver.session() as session:
+            try:
+                session.run(f"CALL gds.graph.drop('{graph_name}', false)")
+            except Exception:
+                pass
+            session.run(f"""
+                CALL gds.graph.create.cypher(
+                    '{graph_name}',
+                    'MATCH (n:RoadOsm)
+                     WHERE n.status = "active"
+                     RETURN id(n) AS id',
+                    'MATCH (n:RoadOsm)-[:CONNECTED]->(m:RoadOsm)
+                     WHERE n.status = "active" AND m.status = "active"
+                     RETURN id(n) AS source, id(m) AS target'
+                )
+            """)
+        print(f"   ✓ Bidirectional projection created: {graph_name}")
+
+    def drop_projection(self, graph_name):
+        with self.driver.session() as session:
+            try:
+                session.run(f"CALL gds.graph.drop('{graph_name}', false)")
+            except Exception:
+                pass
+
+    # ==========================================================
+    # 1. DEGREE — undirected count of distinct neighbors
+    # ==========================================================
+    def calculate_degree(self):
+        """
+        Paper §3.1: degree of a road node = how many other roads
+        share a common junction with it (undirected).
+        """
+        print("\n  [1/12] Degree distribution...")
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (n:RoadOsm)
+                WHERE n.status = 'active'
+                OPTIONAL MATCH (n)-[:CONNECTED]-(m:RoadOsm)
+                WHERE m.status = 'active'
+                WITH n.name AS node_name, count(DISTINCT m) AS degree
+                RETURN node_name, degree
+                ORDER BY degree DESC
+            """)
+            df = pd.DataFrame([dict(r) for r in result])
+        print(f"       nodes={len(df)}, mean_k={df['degree'].mean():.2f}, "
+              f"max_k={df['degree'].max()}, min_k={df['degree'].min()}")
+        return df
+
+    # ==========================================================
+    # 2. BETWEENNESS CENTRALITY — Brandes algorithm (GDS)
+    # ==========================================================
+    def calculate_betweenness(self, graph_name="dual-directed"):
+        """
+        Paper §3.2:  C_B(v) = Σ σ_st(v) / σ_st  (raw)
+
+        Both raw and normalized values are returned.
+        Normalization: C_B / [(N-1)(N-2)/2]  (undirected normalization,
+        appropriate because the dual graph is bidirectional).
+        """
+        print("\n  [2/12] Betweenness centrality...")
+        with self.driver.session() as session:
+            result = session.run(f"""
+                CALL gds.betweenness.stream('{graph_name}')
+                YIELD nodeId, score
+                WITH gds.util.asNode(nodeId) AS node, score
+                RETURN node.name AS node_name,
+                       score AS betweenness
+                ORDER BY score DESC
+            """)
+            df = pd.DataFrame([dict(r) for r in result])
+
+        # Add normalized column
+        N = len(df)
+        if N > 2:
+            denom = (N - 1) * (N - 2) / 2.0
+            df['betweenness_norm'] = df['betweenness'] / denom
+        else:
+            df['betweenness_norm'] = 0.0
+
+        print(f"       raw : max={df['betweenness'].max():.4f}, "
+              f"mean={df['betweenness'].mean():.4f}")
+        print(f"       norm: max={df['betweenness_norm'].max():.6f}, "
+              f"mean={df['betweenness_norm'].mean():.6f}")
+        return df
+
+    # ==========================================================
+    # 3. PAGERANK — d=0.85 (GDS)
+    # ==========================================================
+    def calculate_pagerank(self, graph_name="dual-directed"):
+        """Paper §3.3:  PR(v) = (1-d) + d Σ PR(u)/L(u),  d=0.85"""
+        print("\n  [3/12] PageRank (d=0.85)...")
+        with self.driver.session() as session:
+            result = session.run(f"""
+                CALL gds.pageRank.stream('{graph_name}', {{
+                    dampingFactor: 0.85
+                }})
+                YIELD nodeId, score
+                WITH gds.util.asNode(nodeId) AS node, score
+                RETURN node.name AS node_name,
+                       score AS pagerank
+                ORDER BY score DESC
+            """)
+            df = pd.DataFrame([dict(r) for r in result])
+        print(f"       max={df['pagerank'].max():.4f}, "
+              f"mean={df['pagerank'].mean():.4f}")
+        return df
+
+    # ==========================================================
+    # 4. HARMONIC CLOSENESS — GDS
+    # ==========================================================
+    def calculate_harmonic_closeness(self, graph_name="dual-directed"):
+        """Paper §3.4:  C_H(v) = (1/(N-1)) Σ 1/d(v,u)"""
+        print("\n  [4/12] Harmonic closeness...")
+        with self.driver.session() as session:
+            result = session.run(f"""
+                CALL gds.alpha.closeness.harmonic.stream('{graph_name}')
+                YIELD nodeId, centrality
+                WITH gds.util.asNode(nodeId) AS node, centrality
+                RETURN node.name AS node_name,
+                       centrality AS harmonic_closeness
+                ORDER BY centrality DESC
+            """)
+            df = pd.DataFrame([dict(r) for r in result])
+        print(f"       max={df['harmonic_closeness'].max():.4f}, "
+              f"mean={df['harmonic_closeness'].mean():.4f}")
+        return df
+
+    # ==========================================================
+    # 5a. STANDARD CLUSTERING — UNDIRECTED projection
+    # ==========================================================
+    def calculate_clustering_gds(self, graph_name="dual-undirected"):
+        """
+        Paper §3.5 (standard, undirected formula):
+            C(i) = 2·E_i / [k_i(k_i-1)]
+
+        FIX: This formula is for UNDIRECTED graphs. We now run GDS on
+        the undirected projection so the formula is applied correctly.
+        Values are naturally in [0,1] — no clipping needed.
+        """
+        print("\n  [5/12] Clustering coefficient (standard, undirected)...")
+        with self.driver.session() as session:
+            result = session.run(f"""
+                CALL gds.localClusteringCoefficient.stream('{graph_name}')
+                YIELD nodeId, localClusteringCoefficient
+                WITH gds.util.asNode(nodeId) AS node, localClusteringCoefficient
+                RETURN node.name AS node_name,
+                       localClusteringCoefficient AS clustering_coeff
+                ORDER BY localClusteringCoefficient DESC
+            """)
+            df = pd.DataFrame([dict(r) for r in result])
+
+        # Replace nan/inf with 0 (these come from k<2 nodes — formula undefined)
+        df["clustering_coeff"] = df["clustering_coeff"].replace(
+            [np.inf, -np.inf], np.nan
+        ).fillna(0.0)
+
+        # Sanity check — should never trigger with undirected projection
+        max_val = df["clustering_coeff"].max()
+        if max_val > 1.0 + 1e-9:
+            print(f"       ⚠ WARNING: max CC = {max_val} > 1 — projection may be wrong!")
+
+        print(f"       max={df['clustering_coeff'].max():.4f}, "
+              f"mean={df['clustering_coeff'].mean():.4f}")
+        return df
+
+    # ==========================================================
+    # 5b. ADAPTED CLUSTERING — DIRECTED graph
+    # ==========================================================
+    def calculate_adapted_clustering(self):
+        """
+        Paper §3.5 (adapted for directed):
+            C_a(n) = #LinksBetweenNeighbours / [k_n(k_n - 1)]
+
+        - k_n counts distinct in+out neighbors (undirected count of distinct nodes)
+        - Numerator: total directed links (b)->(c) between neighbors,
+          counting (b)->(c) and (c)->(b) separately
+        - Denominator: k(k-1)  [not /2, because directed]
+
+        FIX: removed silent clip(0,1). If a value > 1 appears, it's a
+        formula bug and we want to see it.
+        """
+        print("\n  [6/12] Adapted clustering (directed)...")
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (a:RoadOsm)
+                WHERE a.status = 'active'
+
+                // Distinct in+out neighbors (undirected count)
+                MATCH (a)-[:CONNECTED]-(neighbor:RoadOsm)
+                WHERE neighbor.status = 'active'
+                WITH a, collect(DISTINCT neighbor) AS neighbors
+                WITH a, neighbors, size(neighbors) AS degree
+                WHERE degree > 1
+
+                // Count directed links between neighbors
+                UNWIND neighbors AS b
+                UNWIND neighbors AS c
+                WITH a, degree, b, c
+                WHERE id(b) <> id(c)
+                OPTIONAL MATCH (b)-[r:CONNECTED]->(c)
+                WITH a, degree, count(r) AS directed_links
+
+                WITH a.name AS node_name,
+                     degree,
+                     toFloat(directed_links) / (degree * (degree - 1)) AS adapted_clustering
+                RETURN node_name, degree, adapted_clustering
+                ORDER BY adapted_clustering DESC
+            """)
+            records = [dict(r) for r in result]
+
+        df = pd.DataFrame(records)
+
+        # Sanity check — must be in [0, 1]
+        if len(df) > 0:
+            max_val = df["adapted_clustering"].max()
+            min_val = df["adapted_clustering"].min()
+            if max_val > 1.0 + 1e-9:
+                print(f"       ⚠ WARNING: adapted CC max = {max_val} > 1 — formula bug!")
+            if min_val < 0.0 - 1e-9:
+                print(f"       ⚠ WARNING: adapted CC min = {min_val} < 0 — formula bug!")
+
+        # Add nodes with degree <= 1 (clustering = 0 by convention)
+        with self.driver.session() as session:
+            result2 = session.run("""
+                MATCH (n:RoadOsm)
+                WHERE n.status = 'active'
+                OPTIONAL MATCH (n)-[:CONNECTED]-(m:RoadOsm)
+                WHERE m.status = 'active'
+                WITH n.name AS node_name, count(DISTINCT m) AS degree
+                WHERE degree <= 1
+                RETURN node_name, degree, 0.0 AS adapted_clustering
+            """)
+            df_low = pd.DataFrame([dict(r) for r in result2])
+
+        df = pd.concat([df, df_low], ignore_index=True)
+
+        print(f"       nodes(k>1)={len(records)}, "
+              f"max={df['adapted_clustering'].max():.4f}, "
+              f"mean={df['adapted_clustering'].mean():.4f}")
+        return df
+
+    # ==========================================================
+    # 6. CONNECTED COMPONENTS — BOTH WCC and SCC
+    # ==========================================================
+    def calculate_components(self, graph_name="dual-directed"):
+        """
+        Paper §3.9: connected components.
+
+        FIX: We now report BOTH:
+          - WCC (Weakly Connected): direction ignored
+          - SCC (Strongly Connected): every node reachable from every other
+            following edge directions
+
+        For an undirected interpretation use WCC; for "every node reachable
+        from every other" in a directed graph, SCC is the strict answer.
+        """
+        print("\n  [7/12] Connected components (WCC + SCC)...")
+        with self.driver.session() as session:
+            # Weakly Connected Components
+            wcc_res = session.run(f"""
+                CALL gds.wcc.stats('{graph_name}')
+                YIELD componentCount, componentDistribution
+                RETURN componentCount, componentDistribution
+            """).single()
+
+            # Strongly Connected Components
+            try:
+                scc_res = session.run(f"""
+                    CALL gds.alpha.scc.stream('{graph_name}')
+                    YIELD nodeId, componentId
+                    RETURN componentId, count(*) AS size
+                    ORDER BY size DESC
+                """)
+                scc_records = [dict(r) for r in scc_res]
+                scc_count = len(scc_records)
+                scc_largest = scc_records[0]["size"] if scc_records else 0
+            except Exception as e:
+                print(f"       ⚠ SCC failed ({e}), trying alternative...")
+                try:
+                    scc_res = session.run(f"""
+                        CALL gds.scc.stream('{graph_name}')
+                        YIELD nodeId, componentId
+                        RETURN componentId, count(*) AS size
+                        ORDER BY size DESC
+                    """)
+                    scc_records = [dict(r) for r in scc_res]
+                    scc_count = len(scc_records)
+                    scc_largest = scc_records[0]["size"] if scc_records else 0
+                except Exception as e2:
+                    print(f"       ⚠ SCC unavailable: {e2}")
+                    scc_count = None
+                    scc_largest = None
+
+        info = {
+            "wcc_count": wcc_res["componentCount"],
+            "wcc_distribution": dict(wcc_res["componentDistribution"]),
+            "scc_count": scc_count,
+            "scc_largest_size": scc_largest,
+        }
+        print(f"       WCC count = {info['wcc_count']}, "
+              f"SCC count = {info['scc_count']}")
+        return info
+
+    # ==========================================================
+    # 7. LOUVAIN COMMUNITIES — UNDIRECTED projection
+    # ==========================================================
+    def calculate_communities(self, graph_name="dual-undirected"):
+        """
+        Paper §3.10:  Q = (1/2m) Σ [A_ij - k_i k_j/2m] δ(c_i,c_j)
+
+        FIX: This formula assumes A_ij symmetric (undirected).
+        We now run Louvain on the undirected projection so the
+        modularity value matches the paper formula.
+        """
+        print("\n  [8/12] Louvain communities (on undirected graph)...")
+        with self.driver.session() as session:
+            result = session.run(f"""
+                CALL gds.louvain.stream('{graph_name}')
+                YIELD nodeId, communityId
+                WITH gds.util.asNode(nodeId) AS node, communityId
+                RETURN node.name AS node_name,
+                       communityId AS community
+            """)
+            comm_df = pd.DataFrame([dict(r) for r in result])
+
+            result2 = session.run(f"""
+                CALL gds.louvain.stats('{graph_name}')
+                YIELD modularity, communityCount
+                RETURN modularity, communityCount
+            """)
+            rec = result2.single()
+            mod_info = {
+                "modularity": rec["modularity"],
+                "community_count": rec["communityCount"],
+            }
+        print(f"       communities={mod_info['community_count']}, "
+              f"Q={mod_info['modularity']:.4f}")
+        return comm_df, mod_info
+
+    # ==========================================================
+    # 8. AVG PATH LENGTH — DIRECTED traversal
+    # ==========================================================
+    def calculate_avg_path_length(self, sample_size=6000):
+        """
+        Paper §3.6:  ℓ = (1/(N(N-1))) Σ d(i,j)
+
+        FIX: traversal now uses directed edges  -[:CONNECTED*]->  so
+        shortest paths follow the directed dual graph (consistent with
+        BC and PR which also use directed paths).
+
+        SAMPLED: For large graphs, samples random source nodes and
+        computes shortest paths to all reachable targets. Resulting
+        value is an estimate of ℓ; D from this is a LOWER BOUND on
+        the true diameter.
+        """
+        print(f"\n  [9/12] Avg path length (sample={sample_size} sources, directed)...")
+        with self.driver.session() as session:
+            count_result = session.run("""
+                MATCH (n:RoadOsm) WHERE n.status = 'active'
+                RETURN count(n) AS cnt
+            """)
+            total_nodes = count_result.single()["cnt"]
+
+            # Directed traversal — note the arrow ->
+            result = session.run("""
+                MATCH (source:RoadOsm)
+                WHERE source.status = 'active'
+                  AND rand() < toFloat($sample) / $total
+                WITH collect(source) AS sources
+
+                UNWIND sources AS s
+                MATCH path = shortestPath((s)-[:CONNECTED*]->(t:RoadOsm))
+                WHERE t.status = 'active' AND s <> t
+                WITH length(path) AS dist
+                WHERE dist > 0
+                RETURN avg(dist) AS avg_path_length,
+                       max(dist) AS sampled_diameter,
+                       count(dist) AS pairs_computed,
+                       stDev(dist) AS std_path_length
+            """, sample=sample_size, total=total_nodes)
+
+            record = result.single()
+            if record and record["avg_path_length"] is not None:
+                info = {
+                    "avg_path_length": record["avg_path_length"],
+                    "sampled_diameter": record["sampled_diameter"],
+                    "pairs_computed": record["pairs_computed"],
+                    "std_path_length": record["std_path_length"],
+                }
+                print(f"       ℓ = {info['avg_path_length']:.4f} "
+                      f"(±{info['std_path_length']:.4f}), "
+                      f"pairs={info['pairs_computed']}, "
+                      f"sampled D = {info['sampled_diameter']}")
+            else:
+                info = {
+                    "avg_path_length": None,
+                    "sampled_diameter": None,
+                    "pairs_computed": 0,
+                    "std_path_length": None,
+                }
+                print("       ⚠ Could not compute (graph may be disconnected)")
+        return info
+
+    # ==========================================================
+    # 9. DIAMETER — value comes from path length sampling
+    # ==========================================================
+    def calculate_diameter(self):
+        """
+        Paper §3.7:  D = max d(i,j)
+
+        Sampled diameter from calculate_avg_path_length() is a LOWER BOUND.
+        Reported as 'sampled_diameter' in summary — clearly labeled as
+        an estimate, not exact.
+        """
+        print("\n  [10/12] Diameter (lower bound from sampling)...")
+        print("       (value from path-length sampling step)")
+        return None
+
+    # ==========================================================
+    # 10. GLOBAL ASSORTATIVITY — Newman's r
+    # ==========================================================
+    def calculate_global_assortativity(self, degree_df=None):
+        """
+        Paper §3.8:
+            r = [M⁻¹ Σ jk - (M⁻¹ Σ ½(j+k))²] /
+                [M⁻¹ Σ ½(j²+k²) - (M⁻¹ Σ ½(j+k))²]
+
+        FIX: Edges are now deduped (id(a) < id(b)) so each undirected
+        edge is counted exactly once, as Newman's formula requires.
+        Degrees are undirected (in+out distinct neighbors).
+        """
+        print("\n  [11/12] Global assortativity (Newman's r)...")
+
+        if degree_df is None:
+            print("       ⚠ degree_df missing")
+            return {"assortativity_r": None, "edge_count": 0}
+
+        deg_map = dict(zip(degree_df["node_name"], degree_df["degree"]))
+
+        with self.driver.session() as session:
+            # Each undirected edge once — id filter avoids double-count
+            result = session.run("""
+                MATCH (a:RoadOsm)-[:CONNECTED]-(b:RoadOsm)
+                WHERE a.status = 'active' AND b.status = 'active'
+                  AND id(a) < id(b)
+                RETURN a.name AS source, b.name AS target
+            """)
+            edges = [(r["source"], r["target"]) for r in result]
+
+        M = len(edges)
+        print(f"       unique edges = {M}")
+
+        if M == 0:
+            return {"assortativity_r": None, "edge_count": 0}
+
+        js = np.array([deg_map.get(s, 0) for s, _ in edges], dtype=float)
+        ks = np.array([deg_map.get(t, 0) for _, t in edges], dtype=float)
+
+        # Newman 2002 formula
+        jk_mean = np.mean(js * ks)
+        jk_sum_half = np.mean(0.5 * (js + ks))
+        jk_sq_half = np.mean(0.5 * (js**2 + ks**2))
+
+        numerator = jk_mean - jk_sum_half**2
+        denominator = jk_sq_half - jk_sum_half**2
+
+        r = numerator / denominator if denominator != 0 else 0.0
+
+        print(f"       r = {r:.6f}  ({'Assortative' if r > 0 else 'Disassortative'})")
+        return {"assortativity_r": r, "edge_count": M}
+
+    # ==========================================================
+    # RANDOM PATH METRICS
+    # ==========================================================
+    def calculate_random_path_metrics(self):
+        """
+        Random path average length + average cost.
+
+        Matches the original resilience analysis logic exactly:
+          - 1500 random source-target pairs
+          - Undirected traversal: [:CONNECTED*]-
+          - Cost = sum of relationship.score (default 1.0)
+          - Length = number of hops
+          - Skips closed roads (n.temp_status IS NULL)
+        """
+        print(f"\n  [+] Random path metrics...")
+
+        # ---- avg cost ----
+        with self.driver.session() as session:
+            try:
+                result = session.run("""
+                    MATCH (source:RoadOsm), (target:RoadOsm)
+                    WHERE source.temp_status IS NULL AND target.temp_status IS NULL
+                      AND source <> target
+                    WITH source, target, rand() AS r
+                    ORDER BY r
+                    LIMIT 1500
+                    MATCH path = shortestPath((source)-[:CONNECTED*]-(target))
+                    WITH path,
+                         reduce(cost = 0.0, rel IN relationships(path) |
+                                cost + coalesce(rel.score, 1.0)) AS pathCost
+                    RETURN avg(pathCost) AS avg_cost
+                """)
+                rec = result.single()
+                avg_cost = rec["avg_cost"] if rec and rec["avg_cost"] is not None else None
+            except Exception as e:
+                print(f"       ⚠ random path cost failed: {e}")
+                avg_cost = None
+
+        # ---- avg length ----
+        with self.driver.session() as session:
+            try:
+                result = session.run("""
+                    MATCH (source:RoadOsm), (target:RoadOsm)
+                    WHERE source.temp_status IS NULL AND target.temp_status IS NULL
+                      AND source <> target
+                    WITH source, target, rand() AS r
+                    ORDER BY r
+                    LIMIT 1500
+                    MATCH path = shortestPath((source)-[:CONNECTED*]-(target))
+                    RETURN avg(length(path)) AS avg_length
+                """)
+                rec = result.single()
+                avg_length = rec["avg_length"] if rec and rec["avg_length"] is not None else None
+            except Exception as e:
+                print(f"       ⚠ random path length failed: {e}")
+                avg_length = None
+
+        info = {
+            "random_path_avg_length": avg_length,
+            "random_path_avg_cost": avg_cost,
+        }
+        print(f"       avg length = {avg_length}, avg cost = {avg_cost}")
+        return info
+
+    # ==========================================================
+    # 11. ASSORTATIVITY SPECTRUM  k_nn(k)
+    # ==========================================================
+    def calculate_assortativity_spectrum(self):
+        """
+        k_nn(k) = average degree of neighbors of nodes with degree k.
+        Uses undirected degree (consistent with §3.1).
+        """
+        print("\n  [12/12] Assortativity spectrum k_nn(k)...")
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (a:RoadOsm)
+                WHERE a.status = 'active'
+
+                MATCH (a)-[:CONNECTED]-(neighbor:RoadOsm)
+                WHERE neighbor.status = 'active'
+                WITH a, count(DISTINCT neighbor) AS degree_a
+
+                MATCH (a)-[:CONNECTED]-(n:RoadOsm)
+                WHERE n.status = 'active'
+                MATCH (n)-[:CONNECTED]-(nn:RoadOsm)
+                WHERE nn.status = 'active'
+                WITH a, degree_a, n, count(DISTINCT nn) AS neighbor_degree
+
+                WITH degree_a, avg(neighbor_degree) AS avg_nn_degree
+
+                RETURN degree_a AS degree,
+                       avg(avg_nn_degree) AS avg_neighbor_degree,
+                       count(*) AS node_count
+                ORDER BY degree_a
+            """)
+            df = pd.DataFrame([dict(r) for r in result])
+        print(f"       degree levels = {len(df)}")
+        return df
+
+    # ==========================================================
+    # CONDUCTANCE PER COMMUNITY
+    # ==========================================================
+    def calculate_conductance(self, community_df):
+        """
+        Edge-ratio conductance per community:
+            external_edges / total_edges_of_community
+
+        (Simpler form than full Cheeger conductance, but consistent
+         within and across communities for comparison.)
+        """
+        print("\n  [+] Community conductance...")
+        comm_map = dict(zip(community_df["node_name"], community_df["community"]))
+
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (a:RoadOsm)-[:CONNECTED]->(b:RoadOsm)
+                WHERE a.status = 'active' AND b.status = 'active'
+                RETURN a.name AS source, b.name AS target
+            """)
+            edges = [dict(r) for r in result]
+
+        community_internal = {}
+        community_total = {}
+
+        for e in edges:
+            src_comm = comm_map.get(e["source"])
+            tgt_comm = comm_map.get(e["target"])
+            if src_comm is None or tgt_comm is None:
+                continue
+            community_total[src_comm] = community_total.get(src_comm, 0) + 1
+            if src_comm == tgt_comm:
+                community_internal[src_comm] = community_internal.get(src_comm, 0) + 1
+
+        comm_sizes = community_df['community'].value_counts()
+        valid_communities = set(comm_sizes[comm_sizes > 3].index)
+
+        conductance_records = []
+        for comm_id in community_total:
+            if comm_id not in valid_communities:
+                continue
+            total = community_total[comm_id]
+            internal = community_internal.get(comm_id, 0)
+            external = total - internal
+            cond = external / total if total > 0 else 0.0
+            size = len(community_df[community_df["community"] == comm_id])
+            conductance_records.append({
+                "community": comm_id,
+                "size": size,
+                "internal_edges": internal,
+                "external_edges": external,
+                "total_edges": total,
+                "conductance": cond,
+            })
+
+        cond_df = pd.DataFrame(conductance_records)
+        if len(cond_df) > 0:
+            cond_df = cond_df.sort_values("size", ascending=False).reset_index(drop=True)
+            print(f"       max={cond_df['conductance'].max():.4f}, "
+                  f"mean={cond_df['conductance'].mean():.4f}, "
+                  f"min={cond_df['conductance'].min():.4f}")
+        return cond_df
+
+    # ==========================================================
+    # STORE METRICS — UNWIND batch (fast)
+    # ==========================================================
+    def store_metrics(self, df):
+        """Store computed metrics back to Neo4j as node properties."""
+        print("\n  Storing metrics on nodes (UNWIND batch)...")
+        cols_to_store = [
+            "pagerank", "harmonic_closeness", "degree",
+            "clustering_coeff", "betweenness", "community",
+            "adapted_clustering",
+        ]
+        available = [c for c in cols_to_store if c in df.columns]
+        if not available:
+            return
+
+        rows = []
+        for _, row in df.iterrows():
+            r = {"name": row["node_name"]}
+            for c in available:
+                v = row[c]
+                r[c] = float(v) if pd.notna(v) else None
+            rows.append(r)
+
+        set_clauses = ", ".join([f"n.{c} = row.{c}" for c in available])
+
+        with self.driver.session() as session:
+            # Process in chunks to avoid huge transactions
+            chunk_size = 1000
+            for i in range(0, len(rows), chunk_size):
+                chunk = rows[i:i + chunk_size]
+                session.run(f"""
+                    UNWIND $rows AS row
+                    MATCH (n:RoadOsm {{name: row.name}})
+                    SET {set_clauses}
+                """, rows=chunk)
+        print(f"       ✓ Stored {len(available)} metrics on {len(rows)} nodes")
+
+
+# ============================================================
+# DEGREE DISTRIBUTION HELPERS
+# ============================================================
+def compute_pk(degree_series):
+    counts = degree_series.value_counts().sort_index()
+    total = len(degree_series)
+    return pd.DataFrame({
+        "degree": counts.index,
+        "count": counts.values,
+        "probability": counts.values / total,
+    })
+
+
+def fit_power_law_ols(pk_df):
+    """OLS in log-log — supplementary only. Clauset MLE is primary."""
+    data = pk_df[(pk_df["degree"] > 0) & (pk_df["probability"] > 0)]
+    if len(data) < 3:
+        return None
+    log_k = np.log(data["degree"].values.astype(float))
+    log_p = np.log(data["probability"].values.astype(float))
+    slope, intercept, r_val, p_val, std_err = stats.linregress(log_k, log_p)
+    return {
+        "gamma": -slope,
+        "intercept": intercept,
+        "r_squared": r_val**2,
+        "std_err": std_err,
+    }
+
+
+def fit_power_law_clauset(degree_series):
+    """
+    Paper §3.1: Clauset, Shalizi, Newman (2009) MLE method.
+    PRIMARY power-law fit. Compares against lognormal alternative.
+    pip install powerlaw
+    """
+    try:
+        import powerlaw
+        data = degree_series.values[degree_series.values > 0]
+        fit = powerlaw.Fit(data, discrete=True, verbose=False)
+        R, p = fit.distribution_compare('power_law', 'lognormal')
+        return {
+            'alpha': fit.alpha,
+            'xmin': fit.xmin,
+            'KS_stat': fit.power_law.D,
+            'vs_lognormal_R': R,
+            'vs_lognormal_p': p,
+        }
+    except ImportError:
+        print("       ⚠ pip install powerlaw  (for proper Clauset MLE fit)")
+        return None
+
+
+def compute_clustering_spectrum(node_df, cc_col="clustering_coeff"):
+    sub = node_df[["degree", cc_col]].dropna()
+    sub = sub[np.isfinite(sub[cc_col]) & (sub[cc_col] >= 0)]
+    if len(sub) < 2:
+        return pd.DataFrame(columns=["degree", "avg_clustering", "node_count"])
+    grouped = sub.groupby("degree")[cc_col].agg(["mean", "count"]).reset_index()
+    grouped.columns = ["degree", "avg_clustering", "node_count"]
+    return grouped
+
+
+def compute_adapted_clustering_spectrum(node_df):
+    sub = node_df[["degree", "adapted_clustering"]].dropna()
+    sub = sub[np.isfinite(sub["adapted_clustering"]) & (sub["adapted_clustering"] >= 0)]
+    if len(sub) < 2:
+        return pd.DataFrame(columns=["degree", "avg_adapted_clustering", "node_count"])
+    grouped = sub.groupby("degree")["adapted_clustering"].agg(["mean", "count"]).reset_index()
+    grouped.columns = ["degree", "avg_adapted_clustering", "node_count"]
+    return grouped
+
+
+# ============================================================
+# PLOTS
+# ============================================================
+def create_all_plots(node_df, pk_df, power_law, clustering_spectrum_df,
+                     adapted_spectrum_df, assortativity_df, community_df,
+                     output_dir):
+    print("\n  Creating visualisations...")
+
+    # Figure 5: Degree Distribution
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    degrees = node_df["degree"].values
+
+    # Integer bins so each bar = one degree value (no gaps)
+    int_bins = np.arange(0, int(degrees.max()) + 2) - 0.5
+    ax1.hist(degrees, bins=int_bins, density=True, alpha=0.7,
+             color="#2c7bb6", edgecolor="white", linewidth=0.3)
+    kde_data = degrees[degrees > 0].astype(float)
+    if len(kde_data) > 1:
+        kde = gaussian_kde(kde_data)
+        x_r = np.linspace(0, degrees.max(), 300)
+        ax1.plot(x_r, kde(x_r), color="#d7191c", linewidth=1.5)
+    ax1.set_xlabel("Degree")
+    ax1.set_ylabel("Density")
+    ax1.set_title("A)", loc="left", fontweight="bold")
+
+    ax2.scatter(pk_df["degree"], pk_df["probability"], s=25,
+                color="#2c7bb6", alpha=0.7, edgecolors="none")
+    ax2.set_xlabel("Degree")
+    ax2.set_ylabel("P(Degree)")
+    ax2.set_title("B)", loc="left", fontweight="bold")
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "fig5_degree_distribution.png"))
+    plt.close()
+    print("       ✓ fig5_degree_distribution.png")
+
+    # Log-log P(k)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    pk_nz = pk_df[pk_df["degree"] > 0]
+    ax.scatter(pk_nz["degree"], pk_nz["probability"], s=20,
+               color="#2c7bb6", alpha=0.7, edgecolors="none")
+    if power_law:
+        k_fit = np.logspace(np.log10(max(pk_nz["degree"].min(), 1)),
+                            np.log10(pk_nz["degree"].max()), 100)
+        p_fit = np.exp(power_law["intercept"]) * k_fit ** (-power_law["gamma"])
+        ax.plot(k_fit, p_fit, "r-", lw=2,
+                label=f"OLS γ={power_law['gamma']:.2f}, R²={power_law['r_squared']:.3f}")
+        ax.legend()
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("Degree $k$")
+    ax.set_ylabel("$P(k)$")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "fig5b_degree_loglog.png"))
+    plt.close()
+    print("       ✓ fig5b_degree_loglog.png")
+
+    # Figure 6: Clustering Spectrum
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    if len(clustering_spectrum_df) > 0:
+        ax1.scatter(clustering_spectrum_df["degree"],
+                    clustering_spectrum_df["avg_clustering"],
+                    s=25, color="#2c7bb6", alpha=0.7, edgecolors="none")
+    ax1.set_xlabel("Degree")
+    ax1.set_ylabel("Mean Clustering Coefficient (standard)")
+    ax1.set_title("A)", loc="left", fontweight="bold")
+
+    if len(adapted_spectrum_df) > 0:
+        ax2.scatter(adapted_spectrum_df["degree"],
+                    adapted_spectrum_df["avg_adapted_clustering"],
+                    s=25, color="#2c7bb6", alpha=0.7, edgecolors="none")
+    ax2.set_xlabel("Degree")
+    ax2.set_ylabel("Adapted Clustering Coefficient")
+    ax2.set_title("B)", loc="left", fontweight="bold")
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "fig6_clustering_spectrum.png"))
+    plt.close()
+    print("       ✓ fig6_clustering_spectrum.png")
+
+    # Figure 7: Assortativity Spectrum
+    if len(assortativity_df) > 3:
+        fig, ax = plt.subplots(figsize=(8, 6))
+        x = assortativity_df["degree"].values.astype(float)
+        y = assortativity_df["avg_neighbor_degree"].values.astype(float)
+        ax.scatter(x, y, s=50, color="#2c7bb6", alpha=0.8, edgecolors="none", zorder=3)
+
+        z = np.polyfit(x, y, 2)
+        p = np.poly1d(z)
+        x_sm = np.linspace(x.min(), x.max(), 100)
+        y_sm = p(x_sm)
+        ax.plot(x_sm, y_sm, "b-", lw=2, zorder=2)
+
+        residuals = y - p(x)
+        std_r = np.std(residuals)
+        ax.fill_between(x_sm, y_sm - 1.96 * std_r, y_sm + 1.96 * std_r,
+                        alpha=0.2, color="#2c7bb6", zorder=1)
+
+        ax.set_xlabel("Degree")
+        ax.set_ylabel("Average Neighbour Degree $k_{nn}(k)$")
+        ax.axhline(y=0, color="gray", ls="-", lw=0.5, alpha=0.5)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "fig7_assortativity_spectrum.png"))
+        plt.close()
+        print("       ✓ fig7_assortativity_spectrum.png")
+
+    # Histograms — only for centralities, not clustering
+    # (clustering is shown via spectrum plot in fig6, not histograms)
+    metrics_hist = [
+        ("degree", "Degree", "#2c7bb6"),
+        ("pagerank", "PageRank", "#1a9641"),
+        ("harmonic_closeness", "Harmonic Closeness", "#fdae61"),
+        ("betweenness", "Betweenness Centrality", "#d7191c"),
+    ]
+    for col, label, color in metrics_hist:
+        if col not in node_df.columns:
+            continue
+        vals = node_df[col].dropna().values
+        vals = vals[np.isfinite(vals)]
+        if len(vals) == 0:
+            continue
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        ax.hist(vals, bins=150, color=color, alpha=0.85,
+                edgecolor="white", linewidth=0.3)
+        ax.set_xlabel(label)
+        ax.set_ylabel("Frequency")
+        stats_text = (f"Count = {len(vals)}\n"
+                      f"Mean = {np.mean(vals):.4f}\n"
+                      f"Median = {np.median(vals):.4f}\n"
+                      f"Std = {np.std(vals):.4f}\n"
+                      f"Min = {np.min(vals):.4f}\n"
+                      f"Max = {np.max(vals):.4f}")
+        ax.text(0.97, 0.95, stats_text, transform=ax.transAxes,
+                va="top", ha="right",
+                bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
+                          edgecolor="gray", alpha=0.9), fontsize=9)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f"hist_{col}.png"))
+        plt.close()
+    print("       ✓ histograms")
+
+    # Correlation matrix
+    metric_cols = ["degree", "pagerank", "harmonic_closeness",
+                   "betweenness", "clustering_coeff"]
+    available = [c for c in metric_cols if c in node_df.columns]
+    sub = node_df[available].dropna()
+
+    if len(sub) > 10:
+        labels_map = {
+            "degree": "Degree", "pagerank": "PR",
+            "harmonic_closeness": "HC", "betweenness": "BC",
+            "clustering_coeff": "CC",
+        }
+        n = len(available)
+        corr_mat = np.zeros((n, n))
+        pval_mat = np.zeros((n, n))
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    corr_mat[i, j] = 1.0
+                else:
+                    c, pv = spearmanr(sub[available[i]], sub[available[j]])
+                    corr_mat[i, j] = c
+                    pval_mat[i, j] = pv
+
+        fig, ax = plt.subplots(figsize=(6, 5))
+        im = ax.imshow(corr_mat, cmap="RdBu_r", vmin=-1, vmax=1, aspect="equal")
+        tl = [labels_map.get(c, c) for c in available]
+        ax.set_xticks(range(n))
+        ax.set_yticks(range(n))
+        ax.set_xticklabels(tl, rotation=45, ha="right")
+        ax.set_yticklabels(tl)
+        for i in range(n):
+            for j in range(n):
+                v = corr_mat[i, j]
+                sig = ""
+                if i != j:
+                    sig = ("***" if pval_mat[i, j] < 0.001 else
+                           "**" if pval_mat[i, j] < 0.01 else
+                           "*" if pval_mat[i, j] < 0.05 else "")
+                color = "white" if abs(v) > 0.6 else "black"
+                ax.text(j, i, f"{v:.3f}{sig}", ha="center", va="center",
+                        fontsize=8, color=color)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Spearman ρ")
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "correlation_matrix.png"))
+        plt.close()
+        print("       ✓ correlation_matrix.png")
+
+    # Scatter pairs
+    pairs = [
+        ("pagerank", "harmonic_closeness", "PR", "HC"),
+        ("degree", "pagerank", "Degree", "PR"),
+        ("degree", "harmonic_closeness", "Degree", "HC"),
+        ("degree", "betweenness", "Degree", "BC"),
+        ("pagerank", "betweenness", "PR", "BC"),
+    ]
+    for xcol, ycol, xl, yl in pairs:
+        if xcol not in node_df.columns or ycol not in node_df.columns:
+            continue
+        s = node_df[[xcol, ycol]].dropna()
+        if len(s) < 10:
+            continue
+        corr, pval = spearmanr(s[xcol], s[ycol])
+        fig, ax = plt.subplots(figsize=(6, 5))
+        ax.scatter(s[xcol], s[ycol], s=8, alpha=0.3,
+                   color="#2c7bb6", edgecolors="none")
+        ax.set_xlabel(xl)
+        ax.set_ylabel(yl)
+        sig = ("***" if pval < 0.001 else "**" if pval < 0.01 else
+               "*" if pval < 0.05 else "")
+        ax.text(0.97, 0.95, f"Spearman = {corr:.4f}{sig}",
+                transform=ax.transAxes, ha="right", va="top",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                          edgecolor="gray", alpha=0.9), fontsize=10)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f"scatter_{xl.lower()}_vs_{yl.lower()}.png"))
+        plt.close()
+    print("       ✓ scatter plots")
+
+    # Community sizes
+    if community_df is not None and len(community_df) > 0:
+        sizes = community_df["community"].value_counts().sort_values(ascending=False)
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        if len(sizes) > 30:
+            top = sizes.head(30)
+            rest = sizes.iloc[30:].sum()
+            x_labels = [str(i) for i in range(1, 31)] + ["Others"]
+            values = list(top.values) + [rest]
+            colors = ["#2c7bb6"] * 30 + ["#cccccc"]
+        else:
+            x_labels = [str(i) for i in range(1, len(sizes) + 1)]
+            values = sizes.values
+            colors = "#2c7bb6"
+        ax.bar(range(len(values)), values, color=colors,
+               edgecolor="white", linewidth=0.3)
+        ax.set_xlabel("Community rank")
+        ax.set_ylabel("Number of nodes")
+        ax.set_xticks(range(len(values)))
+        ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "community_sizes.png"))
+        plt.close()
+        print("       ✓ community_sizes.png")
+
+    print("   ✓ All visualisations done")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    parser = argparse.ArgumentParser(
+        description="Dual Graph Complete Analysis (formula-correct)"
+    )
+    parser.add_argument("--neo4jURL", "-n", required=True)
+    parser.add_argument("--neo4juser", "-u", required=True)
+    parser.add_argument("--neo4jpwd", "-p", required=True)
+    parser.add_argument("--output", "-o", default="results_dual")
+    parser.add_argument("--path-sample", type=int, default=6000)
+    parser.add_argument("--skip-store", action="store_true")
+    args = parser.parse_args()
+
+    setup_plot_style()
+    os.makedirs(args.output, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    print(f"\n{'='*70}")
+    print("DUAL GRAPH — COMPLETE ANALYSIS (formula-correct)")
+    print(f"{'='*70}")
+    print(f"  Started:  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Output:   {args.output}/")
+    print(f"  Two GDS projections used:")
+    print(f"    - dual-directed   : PR, BC, HC, paths, components")
+    print(f"    - dual-undirected : standard CC, Louvain modularity")
+    print(f"{'='*70}")
+
+    analyzer = DualGraphAnalyzer(args.neo4jURL, args.neo4juser, args.neo4jpwd)
+    start = time.time()
+
+    # ---- Both projections ----
+    print("\n  Creating GDS projections...")
+    analyzer.create_directed_projection("dual-directed")
+    analyzer.create_undirected_projection("dual-undirected")
+
+    # ---- Node-level metrics ----
+    deg_df = analyzer.calculate_degree()
+    bc_df = analyzer.calculate_betweenness("dual-directed")
+    pr_df = analyzer.calculate_pagerank("dual-directed")
+    hc_df = analyzer.calculate_harmonic_closeness("dual-directed")
+    cc_df = analyzer.calculate_clustering_gds("dual-undirected")  # ← UNDIRECTED
+    ac_df = analyzer.calculate_adapted_clustering()
+
+    # ---- Merge ----
+    node_df = deg_df
+    for other in [bc_df, pr_df, hc_df, cc_df]:
+        node_df = node_df.merge(other, on="node_name", how="outer")
+
+    ac_merge = ac_df[["node_name", "adapted_clustering"]]
+    node_df = node_df.merge(ac_merge, on="node_name", how="left")
+    node_df = node_df.fillna(0)
+
+    for col in ["degree", "pagerank", "harmonic_closeness", "betweenness"]:
+        if col in node_df.columns:
+            node_df[f"{col}_rank"] = node_df[col].rank(ascending=False).astype(int)
+
+    # ---- Save early (crash protection) ----
+    print("\n  💾 Early save: node_metrics CSV...")
+    node_df.to_csv(os.path.join(args.output, f"node_metrics_{timestamp}.csv"), index=False)
+
+    # ---- Graph-level metrics ----
+    components = analyzer.calculate_components("dual-directed")
+    community_df, mod_info = analyzer.calculate_communities("dual-undirected")  # ← UNDIRECTED
+
+    node_df = node_df.merge(community_df, on="node_name", how="left")
+
+    conductance_df = analyzer.calculate_conductance(community_df)
+    if len(conductance_df) > 0:
+        conductance_df.to_csv(
+            os.path.join(args.output, f"conductance_{timestamp}.csv"),
+            index=False
+        )
+
+    path_info = analyzer.calculate_avg_path_length(sample_size=args.path_sample)
+    _ = analyzer.calculate_diameter()
+
+    random_path_info = analyzer.calculate_random_path_metrics()
+
+    assort_global = analyzer.calculate_global_assortativity(degree_df=deg_df)
+    assort_spectrum_df = analyzer.calculate_assortativity_spectrum()
+
+    # ---- Degree distribution analysis ----
+    print("\n  Degree distribution analysis...")
+    pk_df = compute_pk(node_df["degree"])
+
+    # Clauset MLE — PRIMARY
+    clauset_fit = fit_power_law_clauset(node_df["degree"])
+    if clauset_fit:
+        print(f"       Clauset (primary): α={clauset_fit['alpha']:.4f}, "
+              f"xmin={clauset_fit['xmin']}, "
+              f"KS={clauset_fit['KS_stat']:.4f}, "
+              f"R(vs lognormal)={clauset_fit['vs_lognormal_R']:.4f}, "
+              f"p={clauset_fit['vs_lognormal_p']:.4f}")
+
+    # OLS — supplementary only
+    power_law = fit_power_law_ols(pk_df)
+    if power_law:
+        print(f"       OLS (supplementary): γ = {power_law['gamma']:.4f}, "
+              f"R² = {power_law['r_squared']:.4f}")
+
+    # P(k) key values
+    pk4 = pk_df.loc[pk_df["degree"] == 4, "probability"].sum() if 4 in pk_df["degree"].values else 0
+    pk2to4 = pk_df.loc[(pk_df["degree"] >= 2) & (pk_df["degree"] <= 4), "probability"].sum()
+    pk1 = pk_df.loc[pk_df["degree"] == 1, "probability"].sum() if 1 in pk_df["degree"].values else 0
+    print(f"       P(k=4)={pk4:.2%}, P(2≤k≤4)={pk2to4:.2%}, P(k=1)={pk1:.2%}")
+
+    # Clustering spectra
+    clust_spectrum = compute_clustering_spectrum(node_df, "clustering_coeff")
+    adapted_spectrum = compute_adapted_clustering_spectrum(node_df)
+
+    # ---- Store on Neo4j ----
+    if not args.skip_store:
+        try:
+            analyzer.store_metrics(node_df)
+        except Exception as e:
+            print(f"       ⚠ Store failed: {e}")
+
+    # ---- Drop projections ----
+    analyzer.drop_projection("dual-directed")
+    analyzer.drop_projection("dual-undirected")
+
+    # ---- Save all CSVs ----
+    print("\n  💾 Saving all CSVs...")
+    node_df.to_csv(os.path.join(args.output, f"node_metrics_{timestamp}.csv"), index=False)
+    pk_df.to_csv(os.path.join(args.output, f"degree_distribution_{timestamp}.csv"), index=False)
+    clust_spectrum.to_csv(os.path.join(args.output, f"clustering_spectrum_{timestamp}.csv"), index=False)
+    adapted_spectrum.to_csv(os.path.join(args.output, f"adapted_clustering_spectrum_{timestamp}.csv"), index=False)
+    assort_spectrum_df.to_csv(os.path.join(args.output, f"assortativity_spectrum_{timestamp}.csv"), index=False)
+    print("       ✓ All CSVs saved")
+
+    # ---- Top 10 ----
+    print(f"\n  TOP 10 BY EACH METRIC:")
+    for col, label in [("degree", "Degree"), ("pagerank", "PR"),
+                       ("harmonic_closeness", "HC"), ("betweenness", "BC")]:
+        if col in node_df.columns:
+            print(f"\n    {label}:")
+            print(node_df.nlargest(10, col)[["node_name", col]].to_string(index=False))
+
+    # ---- Plots ----
+    try:
+        create_all_plots(node_df, pk_df, power_law, clust_spectrum,
+                         adapted_spectrum, assort_spectrum_df, community_df,
+                         args.output)
+    except Exception as e:
+        print(f"\n  ⚠ Plot creation failed: {e}")
+
+    # ---- SUMMARY ----
+    elapsed = time.time() - start
+    N = len(node_df)
+    M = assort_global.get("edge_count", 0)
+
+    summary = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "total_nodes": N,
+        "total_edges_undirected": M,
+        "network_density": (2 * M) / (N * (N - 1)) if N > 1 else 0,
+        # Components
+        "wcc_count": components["wcc_count"],
+        "scc_count": components["scc_count"],
+        "scc_largest": components["scc_largest_size"],
+        # Communities
+        "communities": mod_info["community_count"],
+        "modularity_Q": mod_info["modularity"],
+        # Degree
+        "min_degree": int(node_df["degree"].min()),
+        "mean_degree": node_df["degree"].mean(),
+        "median_degree": node_df["degree"].median(),
+        "max_degree": int(node_df["degree"].max()),
+        "std_degree": node_df["degree"].std(),
+        # Power law (Clauset is primary)
+        "clauset_alpha": clauset_fit["alpha"] if clauset_fit else None,
+        "clauset_xmin": clauset_fit["xmin"] if clauset_fit else None,
+        "clauset_KS": clauset_fit["KS_stat"] if clauset_fit else None,
+        "clauset_vs_lognormal_R": clauset_fit["vs_lognormal_R"] if clauset_fit else None,
+        "clauset_vs_lognormal_p": clauset_fit["vs_lognormal_p"] if clauset_fit else None,
+        "ols_gamma_supplementary": power_law["gamma"] if power_law else None,
+        "ols_R2_supplementary": power_law["r_squared"] if power_law else None,
+        # PageRank
+        "min_pagerank": node_df["pagerank"].min(),
+        "mean_pagerank": node_df["pagerank"].mean(),
+        "median_pagerank": node_df["pagerank"].median(),
+        "max_pagerank": node_df["pagerank"].max(),
+        "std_pagerank": node_df["pagerank"].std(),
+        # Harmonic Closeness
+        "min_harmonic_closeness": node_df["harmonic_closeness"].min(),
+        "mean_harmonic_closeness": node_df["harmonic_closeness"].mean(),
+        "median_harmonic_closeness": node_df["harmonic_closeness"].median(),
+        "max_harmonic_closeness": node_df["harmonic_closeness"].max(),
+        "std_harmonic_closeness": node_df["harmonic_closeness"].std(),
+        # Betweenness (raw)
+        "min_betweenness": node_df["betweenness"].min(),
+        "mean_betweenness": node_df["betweenness"].mean(),
+        "median_betweenness": node_df["betweenness"].median(),
+        "max_betweenness": node_df["betweenness"].max(),
+        "std_betweenness": node_df["betweenness"].std(),
+        # Betweenness (normalized by (N-1)(N-2)/2)
+        "min_betweenness_norm": node_df["betweenness_norm"].min() if "betweenness_norm" in node_df.columns else None,
+        "mean_betweenness_norm": node_df["betweenness_norm"].mean() if "betweenness_norm" in node_df.columns else None,
+        "median_betweenness_norm": node_df["betweenness_norm"].median() if "betweenness_norm" in node_df.columns else None,
+        "max_betweenness_norm": node_df["betweenness_norm"].max() if "betweenness_norm" in node_df.columns else None,
+        "std_betweenness_norm": node_df["betweenness_norm"].std() if "betweenness_norm" in node_df.columns else None,
+        # Clustering (standard, undirected)
+        "min_clustering_coeff": node_df["clustering_coeff"].min(),
+        "mean_clustering_coeff": node_df["clustering_coeff"].mean(),
+        "median_clustering_coeff": node_df["clustering_coeff"].median(),
+        "max_clustering_coeff": node_df["clustering_coeff"].max(),
+        "std_clustering_coeff": node_df["clustering_coeff"].std(),
+        # Adapted clustering (directed)
+        "min_adapted_clustering": node_df["adapted_clustering"].min(),
+        "mean_adapted_clustering": node_df["adapted_clustering"].mean(),
+        "median_adapted_clustering": node_df["adapted_clustering"].median(),
+        "max_adapted_clustering": node_df["adapted_clustering"].max(),
+        "std_adapted_clustering": node_df["adapted_clustering"].std(),
+        # Path length / Diameter (sampled, directed)
+        "avg_path_length_sampled": path_info.get("avg_path_length"),
+        "std_path_length_sampled": path_info.get("std_path_length"),
+        "diameter_lower_bound": path_info.get("sampled_diameter"),
+        "path_pairs_computed": path_info.get("pairs_computed"),
+        # Random path metrics (1500 random pairs, undirected, weighted by score)
+        "random_path_avg_length": random_path_info.get("random_path_avg_length"),
+        "random_path_avg_cost": random_path_info.get("random_path_avg_cost"),
+        # Assortativity
+        "assortativity_r": assort_global.get("assortativity_r"),
+        # Conductance
+        "conductance_mean": conductance_df["conductance"].mean() if len(conductance_df) > 0 else None,
+        "conductance_max": conductance_df["conductance"].max() if len(conductance_df) > 0 else None,
+        "conductance_min": conductance_df["conductance"].min() if len(conductance_df) > 0 else None,
+        "elapsed_minutes": elapsed / 60,
+    }
+
+    summary_df = pd.DataFrame([summary])
+    summary_file = os.path.join(args.output, f"graph_summary_{timestamp}.csv")
+    summary_df.to_csv(summary_file, index=False)
+
+    print(f"\n{'='*70}")
+    print("ANALYSIS SUMMARY")
+    print(f"{'='*70}")
+    for k, v in summary.items():
+        if isinstance(v, float) and v is not None:
+            print(f"  {k:<32} {v:.6f}")
+        else:
+            print(f"  {k:<32} {v}")
+    print(f"{'='*70}")
+    print(f"  Completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Total time: {elapsed/60:.2f} minutes")
+    print(f"  Results in: {args.output}/")
+    print(f"{'='*70}\n")
+
+    analyzer.close()
+
+
+if __name__ == "__main__":
+    main()
