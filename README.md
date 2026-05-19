@@ -1,6 +1,6 @@
 # Scalable Multi-Layer Graph Framework for Road Network Analysis and Disruption Simulation
 
-A Python-based framework that constructs multi-layer graph representations of urban road networks using OpenStreetMap data and Neo4j. It supports large-area graph generation with parallel processing, POI integration, dual (road-section) graph construction, network analysis through centrality and community detection algorithms, resilience evaluation under road closure scenarios, and shortest-path routing with disruption simulation.
+A Python-based framework that constructs multi-layer graph representations of urban road networks using OpenStreetMap data and Neo4j. It supports large-area graph generation with parallel processing, POI integration, dual graph construction, network analysis through centrality and community detection algorithms, resilience evaluation under road closure scenarios, and shortest-path routing with disruption simulation.
 
 ## Requirements
 
