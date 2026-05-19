@@ -49,7 +49,7 @@ The framework follows a sequential pipeline. Each step produces CSV files or upd
 Generates a large-area road network graph from OSM by dividing the area into overlapping grid sections, downloading each in parallel, merging, deduplicating, filtering by boundary, and validating connectivity.
 
 ```shell
-python "Create Road Network Graph" -x 44.645885 -y 10.9255707 -d 5 -o ./output
+python "Create Road Network Graph" -x latitude -y longitude -d 5 -o ./output
 ```
 
 | Parameter | Description |
