@@ -1,0 +1,490 @@
+import osmnx as ox
+import argparse
+import os
+import time
+import pandas as pd
+import math
+import networkx as nx
+from typing import List, Tuple
+from multiprocessing import Pool, cpu_count
+import multiprocessing
+
+
+class LargeAreaGraphGenerator:
+    def __init__(self, import_folder_path: str):
+        self.import_folder_path = import_folder_path
+        if not os.path.exists(self.import_folder_path):
+            os.makedirs(self.import_folder_path)
+
+    def get_processed_sections(self):
+        """Read or create a file to track processed section numbers"""
+        processed_file = os.path.join(self.import_folder_path, "processed_graph_sections.txt")
+        processed_sections = set()
+        if os.path.exists(processed_file):
+            with open(processed_file, 'r') as f:
+                for line in f:
+                    try:
+                        processed_sections.add(int(line.strip()))
+                    except ValueError:
+                        continue
+        return processed_sections
+
+    def save_processed_section(self, section_num: int):
+        """Save a processed section number to the tracking file"""
+        processed_file = os.path.join(self.import_folder_path, "processed_graph_sections.txt")
+        with open(processed_file, 'a') as f:
+            f.write(f"{section_num}\n")
+
+    def section_files_exist(self, section_num: int) -> bool:
+        """Check if both nodes and rels CSV files exist for a section"""
+        nodes_csv_name = f"nodes_{section_num}.csv"
+        rels_csv_name = f"rels_{section_num}.csv"
+        nodes_path = os.path.join(self.import_folder_path, nodes_csv_name)
+        rels_path = os.path.join(self.import_folder_path, rels_csv_name)
+        return os.path.exists(nodes_path) and os.path.exists(rels_path)
+
+    @staticmethod
+    def km_to_degrees(km_lat: float, km_lon: float, reference_lat: float) -> Tuple[float, float]:
+        """Convert kilometers to degrees"""
+        degrees_lat = km_lat / 111.32
+        degrees_lon = km_lon / (111.32 * math.cos(math.radians(reference_lat)))
+        return degrees_lat, degrees_lon
+
+    def calculate_grid_points(self, center_lat: float, center_lon: float,
+                              total_distance_km: float, area_size_km: float,
+                              overlap_km: float) -> List[Tuple[float, float]]:
+        """Calculate all grid center points for the large area"""
+        points = []
+        step_size_km = area_size_km - overlap_km
+        steps_needed = math.ceil(total_distance_km / step_size_km)
+        start_offset_km = -(steps_needed - 1) * step_size_km / 2
+
+        for i in range(steps_needed):
+            for j in range(steps_needed):
+                offset_lat_km = start_offset_km + i * step_size_km
+                offset_lon_km = start_offset_km + j * step_size_km
+                deg_lat, deg_lon = self.km_to_degrees(offset_lat_km, offset_lon_km, center_lat)
+                new_lat = center_lat + deg_lat
+                new_lon = center_lon + deg_lon
+                points.append((new_lat, new_lon))
+
+        return points
+
+    def generate_single_graph(self, lat: float, lon: float, distance_km: float,
+                              graph_name: str) -> nx.MultiDiGraph:
+        """Generate a single graph and return NetworkX graph"""
+        distance_m = distance_km * 1000
+        print(f"Generating graph {graph_name} at ({lat:.6f}, {lon:.6f}) with radius {distance_km}km")
+
+        try:
+            G = ox.graph_from_point(
+                (lat, lon),
+                dist=int(distance_m),
+                dist_type='bbox',
+                simplify=False,
+                custom_filter='["highway"~"motorway|trunk|primary|secondary|tertiary|residential|unclassified|service"]'
+            )
+
+            # Apply custom driveability rules
+            for u, v, k, data in G.edges(keys=True, data=True):
+                highway = data.get('highway')
+                access = data.get('access')
+                data['driveable'] = "True"
+
+                if access in {"no", "private"}:
+                    data['driveable'] = "False"
+                elif highway == 'service':
+                    data['driveable'] = "False"
+                elif highway == 'residential' and access == 'private':
+                    data['driveable'] = "False"
+
+            return G
+        except Exception as e:
+            print(f"Warning: Could not generate graph for {graph_name}: {e}")
+            return None
+
+    def filter_graph_by_boundary(self, nodes_df: pd.DataFrame, rels_df: pd.DataFrame,
+                                 center_lat: float, center_lon: float,
+                                 total_distance_km: float) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Filter merged nodes and rels DataFrames by square boundary around the center"""
+        delta_lat, delta_lon = self.km_to_degrees(total_distance_km, total_distance_km, center_lat)
+        min_lat = center_lat - delta_lat
+        max_lat = center_lat + delta_lat
+        min_lon = center_lon - delta_lon
+        max_lon = center_lon + delta_lon
+
+        print(f"Applying boundary filter: lat [{min_lat:.6f}, {max_lat:.6f}], lon [{min_lon:.6f}, {max_lon:.6f}]")
+        original_node_count = len(nodes_df)
+        original_rel_count = len(rels_df)
+
+        # Filter nodes by lat/lon (y = lat, x = lon)
+        nodes_df = nodes_df[
+            (nodes_df['y'] >= min_lat) & (nodes_df['y'] <= max_lat) &
+            (nodes_df['x'] >= min_lon) & (nodes_df['x'] <= max_lon)
+        ].copy()
+
+        # Filter rels to only keep edges where both source and target are in the filtered nodes
+        valid_node_ids = set(nodes_df['osmnode_id'].astype(str))
+        rels_df = rels_df[
+            rels_df['source_id'].astype(str).isin(valid_node_ids) &
+            rels_df['target_id'].astype(str).isin(valid_node_ids)
+        ].copy()
+
+        print(f"Boundary filter removed {original_node_count - len(nodes_df)} nodes and {original_rel_count - len(rels_df)} rels")
+        print(f"After boundary filter: {len(nodes_df)} nodes, {len(rels_df)} rels")
+
+        return nodes_df, rels_df
+
+    def _flatten_value(self, value):
+        """Flatten list values to semicolon-separated strings for CSV"""
+        if isinstance(value, list):
+            return ";".join(str(v) for v in value)
+        return value
+
+    def extract_nodes_and_relationships(self, G: nx.MultiDiGraph) -> Tuple[List[dict], List[dict]]:
+        """Extract ALL node and relationship properties from NetworkX graph"""
+        nodes_data = []
+        rels_data = []
+
+        # Extract nodes with ALL properties
+        for node, data in G.nodes(data=True):
+            node_dict = {'osmnode_id': str(node)}
+            # Add geometry
+            if data.get('y') and data.get('x'):
+                node_dict['geometry'] = f"POINT({data.get('y')} {data.get('x')})"
+            else:
+                node_dict['geometry'] = None
+            # Add ALL other properties from OSM
+            for key, value in data.items():
+                node_dict[key] = self._flatten_value(value)
+            nodes_data.append(node_dict)
+
+        # Extract relationships with ALL properties
+        for u, v, k, data in G.edges(keys=True, data=True):
+            rel_dict = {
+                'source_id': str(u),
+                'target_id': str(v),
+            }
+            # Add ALL properties from OSM, rename osmid to osmway_id
+            for key, value in data.items():
+                if key == 'osmid':
+                    rel_dict['osmway_id'] = self._flatten_value(value)
+                else:
+                    rel_dict[key] = self._flatten_value(value)
+            # Ensure 'status' is present
+            if 'status' not in rel_dict:
+                rel_dict['status'] = 'active'
+            rels_data.append(rel_dict)
+
+        return nodes_data, rels_data
+
+    def process_single_section(self, lat: float, lon: float, distance_km: float,
+                               section_num: int, center_lat: float, center_lon: float,
+                               total_distance_km: float) -> Tuple[str, str]:
+        """Process a single section using NetworkX and return CSV filenames.
+        No boundary filtering here -- that happens after merging all sections."""
+        graph_name = f"g{section_num}"
+        nodes_csv_name = f"nodes_{section_num}.csv"
+        rels_csv_name = f"rels_{section_num}.csv"
+
+        print(f"Processing section {section_num} on process {os.getpid()}")
+
+        # Generate graph using NetworkX
+        G = self.generate_single_graph(lat, lon, distance_km, graph_name)
+        
+        # Handle empty sections
+        if G is None or G.number_of_nodes() == 0:
+            print(f"Section {section_num} is empty, creating empty CSV files")
+            empty_nodes_df = pd.DataFrame(columns=['osmnode_id'])
+            empty_rels_df = pd.DataFrame(columns=['source_id', 'target_id'])
+            
+            nodes_csv_path = os.path.join(self.import_folder_path, nodes_csv_name)
+            rels_csv_path = os.path.join(self.import_folder_path, rels_csv_name)
+            empty_nodes_df.to_csv(nodes_csv_path, index=False)
+            empty_rels_df.to_csv(rels_csv_path, index=False)
+            
+            return nodes_csv_name, rels_csv_name
+
+        # NO per-section boundary filtering -- just extract raw data from the graph
+        nodes_data, rels_data = self.extract_nodes_and_relationships(G)
+
+        # Save to CSV with simple headers
+        nodes_csv_path = os.path.join(self.import_folder_path, nodes_csv_name)
+        rels_csv_path = os.path.join(self.import_folder_path, rels_csv_name)
+
+        nodes_df = pd.DataFrame(nodes_data)
+        nodes_df.to_csv(nodes_csv_path, index=False)
+        rels_df = pd.DataFrame(rels_data)
+        rels_df.to_csv(rels_csv_path, index=False)
+        
+        print(f"Section {section_num} completed: {len(nodes_data)} nodes, {len(rels_data)} relationships")
+
+        return nodes_csv_name, rels_csv_name
+
+    def merge_csv_files(self, nodes_csv_files: List[str], rels_csv_files: List[str],
+                        center_lat: float, center_lon: float,
+                        total_distance_km: float) -> Tuple[str, str]:
+        """Merge all nodes and relationships CSV files, deduplicate, and apply boundary filter"""
+        print(f"Merging {len(nodes_csv_files)} nodes CSV files and {len(rels_csv_files)} relationships CSV files...")
+
+        all_nodes_data = []
+        for nodes_csv_file in nodes_csv_files:
+            nodes_csv_path = os.path.join(self.import_folder_path, nodes_csv_file)
+            if os.path.exists(nodes_csv_path):
+                df = pd.read_csv(nodes_csv_path)
+                if len(df) > 0:
+                    all_nodes_data.append(df)
+                    print(f"Loaded {len(df)} nodes from {nodes_csv_file}")
+
+        all_rels_data = []
+        for rels_csv_file in rels_csv_files:
+            rels_csv_path = os.path.join(self.import_folder_path, rels_csv_file)
+            if os.path.exists(rels_csv_path):
+                df = pd.read_csv(rels_csv_path)
+                if len(df) > 0:
+                    all_rels_data.append(df)
+                    print(f"Loaded {len(df)} relationships from {rels_csv_file}")
+
+        # Merge and remove duplicates
+        if all_nodes_data:
+            combined_nodes_df = pd.concat(all_nodes_data, ignore_index=True, sort=False)
+            combined_nodes_df = combined_nodes_df.drop_duplicates(subset=['osmnode_id'], keep='first')
+        else:
+            combined_nodes_df = pd.DataFrame(columns=['osmnode_id'])
+
+        if all_rels_data:
+            combined_rels_df = pd.concat(all_rels_data, ignore_index=True, sort=False)
+            combined_rels_df = combined_rels_df.drop_duplicates(subset=['source_id', 'target_id'], keep='first')
+        else:
+            combined_rels_df = pd.DataFrame(columns=['source_id', 'target_id'])
+
+        print(f"After deduplication: {len(combined_nodes_df)} unique nodes, {len(combined_rels_df)} unique relationships")
+
+        # Apply boundary filter on the merged data
+        print(f"\n--- Applying boundary filter on merged data ---")
+        combined_nodes_df, combined_rels_df = self.filter_graph_by_boundary(
+            combined_nodes_df, combined_rels_df,
+            center_lat, center_lon, total_distance_km
+        )
+
+        nodes_filename = "fullgraph_nodes.csv"
+        rels_filename = "fullgraph_rels.csv"
+        nodes_path = os.path.join(self.import_folder_path, nodes_filename)
+        rels_path = os.path.join(self.import_folder_path, rels_filename)
+        combined_nodes_df.to_csv(nodes_path, index=False)
+        combined_rels_df.to_csv(rels_path, index=False)
+
+        print(f"Merged nodes CSV saved as {nodes_filename} with {len(combined_nodes_df)} unique nodes")
+        print(f"Merged relationships CSV saved as {rels_filename} with {len(combined_rels_df)} unique relationships")
+        return nodes_filename, rels_filename
+
+    def generate_large_area_graph(self, center_lat: float, center_lon: float,
+                                  total_distance_km: float, area_size_km: float,
+                                  overlap_km: float):
+        """Main method to generate large area graph with parallel processing"""
+        print(f"Large area graph generation...")
+        print(f"Center: ({center_lat}, {center_lon})")
+        print(f"Total area: {total_distance_km}km")
+        print(f"Section size: {area_size_km}km")
+        print(f"Overlap: {overlap_km}km")
+
+        # Check available CPU cores
+        available_cores = cpu_count()
+        print(f"\nAvailable CPU cores: {available_cores}")
+        print(f"Will use {available_cores} parallel processes")
+
+        grid_points = self.calculate_grid_points(center_lat, center_lon,
+                                                 total_distance_km, area_size_km, overlap_km)
+
+        # Load processed sections
+        processed_sections = self.get_processed_sections()
+        print(f"Found {len(processed_sections)} previously processed sections: {processed_sections}")
+
+        print(f"Will generate {len(grid_points)} sections")
+
+        nodes_csv_files = []
+        rels_csv_files = []
+        
+        # Prepare tasks for parallel processing
+        tasks = []
+        for i, (lat, lon) in enumerate(grid_points, 1):
+            nodes_csv_name = f"nodes_{i}.csv"
+            rels_csv_name = f"rels_{i}.csv"
+            
+            # Check if already processed
+            if i in processed_sections and self.section_files_exist(i):
+                print(f"Skipping section {i}/{len(grid_points)} (already processed)")
+                nodes_csv_files.append(nodes_csv_name)
+                rels_csv_files.append(rels_csv_name)
+                continue
+            
+            # Add to tasks for parallel processing
+            tasks.append((lat, lon, area_size_km, i, center_lat, center_lon, total_distance_km))
+        
+        if tasks:
+            print(f"\n{len(tasks)} sections to process in parallel...")
+            
+            try:
+                # Create a pool of workers
+                with Pool(processes=available_cores) as pool:
+                    # Process sections in parallel
+                    results = pool.starmap(self.process_section_wrapper, tasks)
+                    
+                    # Collect results and save progress
+                    for section_num, (nodes_csv_name, rels_csv_name) in results:
+                        nodes_csv_files.append(nodes_csv_name)
+                        rels_csv_files.append(rels_csv_name)
+                        self.save_processed_section(section_num)
+                        print(f"Section {section_num} marked as complete")
+                        
+            except Exception as e:
+                print(f"\n=== Graph generation interrupted ===")
+                print(f"Error: {e}")
+                print(f"Progress saved. You can restart to resume.")
+                raise
+        else:
+            print("\nAll sections already processed!")
+
+        print(f"\n--- Merging all CSV files ---")
+        nodes_csv, rels_csv = self.merge_csv_files(
+            nodes_csv_files, rels_csv_files,
+            center_lat, center_lon, total_distance_km
+        )
+
+        print(f"\n--- Validating connected components ---")
+        nodes_csv, rels_csv = self.validate_connected_component(nodes_csv, rels_csv)
+
+        print(f"\nfullgraph_nodes.csv and fullgraph_rels.csv completed successfully!")
+        print(f"Nodes CSV: {nodes_csv}")
+        print(f"Relationships CSV: {rels_csv}")
+        
+        # Clean up the progress file after successful completion
+        processed_file = os.path.join(self.import_folder_path, "processed_graph_sections.txt")
+        if os.path.exists(processed_file):
+            os.remove(processed_file)
+            print("Cleaned up progress tracking file.")
+
+    def validate_connected_component(self, nodes_csv: str, rels_csv: str) -> Tuple[str, str]:
+        """Validate that the graph is a single connected component, keep only the largest"""
+        nodes_path = os.path.join(self.import_folder_path, nodes_csv)
+        rels_path = os.path.join(self.import_folder_path, rels_csv)
+
+        nodes_df = pd.read_csv(nodes_path)
+        rels_df = pd.read_csv(rels_path)
+
+        # Build undirected graph for connectivity check
+        G = nx.Graph()
+        for node_id in nodes_df['osmnode_id']:
+            G.add_node(node_id)
+        for _, row in rels_df.iterrows():
+            G.add_edge(row['source_id'], row['target_id'])
+
+        components = list(nx.connected_components(G))
+        print(f"Found {len(components)} connected components")
+
+        if len(components) == 1:
+            print("Graph is already a single connected component. No changes needed.")
+            return nodes_csv, rels_csv
+
+        # Find largest component
+        largest = max(components, key=len)
+        removed_nodes = sum(len(c) for c in components) - len(largest)
+        print(f"Largest component: {len(largest)} nodes")
+        print(f"Removing {removed_nodes} isolated nodes from {len(components) - 1} smaller components")
+
+        # Filter to keep only largest component
+        nodes_df = nodes_df[nodes_df['osmnode_id'].isin(largest)]
+        rels_df = rels_df[
+            rels_df['source_id'].isin(largest) & rels_df['target_id'].isin(largest)
+        ]
+
+        # Overwrite the files
+        nodes_df.to_csv(nodes_path, index=False)
+        rels_df.to_csv(rels_path, index=False)
+
+        print(f"Validated graph: {len(nodes_df)} nodes, {len(rels_df)} edges (single connected component)")
+        return nodes_csv, rels_csv
+
+    def process_section_wrapper(self, lat: float, lon: float, distance_km: float,
+                                section_num: int, center_lat: float, center_lon: float,
+                                total_distance_km: float) -> Tuple[int, Tuple[str, str]]:
+        """Wrapper function for parallel processing"""
+        try:
+            print(f"\n--- Processing section {section_num} ---")
+            result = self.process_single_section(lat, lon, distance_km, section_num, 
+                                                 center_lat, center_lon, total_distance_km)
+            return (section_num, result)
+        except Exception as e:
+            print(f"Error processing section {section_num}: {e}")
+            raise
+
+
+def add_options():
+    parser = argparse.ArgumentParser(description='Creation of routing graph for large areas.')
+    parser.add_argument('--latitude', '-x', dest='lat', type=float, required=True)
+    parser.add_argument('--longitude', '-y', dest='lon', type=float, required=True)
+    parser.add_argument('--distance', '-d', dest='dist', type=float, required=True)
+    parser.add_argument('--output', '-o', dest='output', type=str, required=True)
+    return parser
+
+
+def get_user_input():
+    """Get area size and overlap from user"""
+    print("\n=== Large Area Graph Generator===")
+
+    while True:
+        try:
+            area_size = float(input("Enter the area size for each section (in km): "))
+            if area_size <= 0:
+                print("Area size must be positive. Please try again.")
+                continue
+            break
+        except ValueError:
+            print("Please enter a valid number.")
+
+    while True:
+        try:
+            overlap = float(input("Enter the overlap between sections (in km): "))
+            if overlap < 0:
+                print("Overlap cannot be negative. Please try again.")
+                continue
+            if overlap >= area_size:
+                print("Overlap must be less than area size. Please try again.")
+                continue
+            break
+        except ValueError:
+            print("Please enter a valid number.")
+
+    return area_size, overlap
+
+
+def main(args=None):
+    start_time = time.time()
+    argParser = add_options()
+    options = argParser.parse_args(args=args)
+
+    area_size_km, overlap_km = get_user_input()
+
+    generator = LargeAreaGraphGenerator(options.output)
+
+    try:
+        generator.generate_large_area_graph(
+            center_lat=options.lat,
+            center_lon=options.lon,
+            total_distance_km=options.dist,
+            area_size_km=area_size_km,
+            overlap_km=overlap_km
+        )
+
+    except Exception as e:
+        print(f"Error during graph generation: {e}")
+        raise
+
+    end_time = time.time()
+    elapsed = end_time - start_time
+    print(f"\nTotal execution time: {elapsed:.2f} seconds")
+    return 0
+
+
+if __name__ == "__main__":
+    main()
