@@ -100,7 +100,7 @@ python "Creation of Dual Graph" -n fullgraph_nodes.csv -r fullgraph_rels.csv -o 
 | `-r` | Path to fullgraph_rels.csv |
 | `-o` | Output folder for dual graph CSVs |
 
-**Output:** `dual_nodes.csv` and `dual_edges.csv`. Import these into Neo4j using `neo4j-admin import`, then run Initialize Graph Properties again to set the RoadOsm labels.
+**Output:** `dual_nodes.csv` and `dual_edges.csv`.
 
 ---
 
