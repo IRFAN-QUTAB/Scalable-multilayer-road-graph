@@ -1,0 +1,279 @@
+from neo4j import GraphDatabase
+import argparse
+
+
+class App:
+    def __init__(self, uri, user, password):
+        self.driver = GraphDatabase.driver(uri, auth=(user, password))
+
+    def close(self):
+        self.driver.close()
+
+    # =========================================================================
+    # STEP 1: Labels
+    # =========================================================================
+    def set_labels(self):
+        with self.driver.session() as session:
+            session.execute_write(self._set_labels)
+
+    @staticmethod
+    def _set_labels(tx):
+        # RoadJunction label — from Code 1: MATCH (n) SET n:RoadJunction
+        # Only road nodes (no node_type property means it came from the road graph)
+        tx.run("""
+            MATCH (n)
+            WHERE n.node_type IS NULL OR n.node_type = 'RoadJunction'
+            SET n:RoadJunction
+        """)
+        print("? RoadJunction labels set")
+
+        # OSMNode label — from Code 3: nodes with node_type='OSMNode'
+        # This covers both standalone amenity nodes AND way-member nodes
+        tx.run("""
+            MATCH (n)
+            WHERE n.node_type = 'OSMNode'
+            SET n:OSMNode
+        """)
+        print("? OSMNode labels set")
+
+        # POI label — from Code 3: standalone amenity nodes get OSMNode:POI
+        # poi_type='OSMNode' means it's a standalone amenity node (not just a way member)
+        tx.run("""
+            MATCH (n)
+            WHERE n.node_type = 'OSMNode' AND n.poi_type = 'OSMNode'
+            SET n:POI
+        """)
+        print("? OSMNode:POI labels set")
+
+        # OSMWay:POI label — from Code 3: way-based amenities
+        tx.run("""
+            MATCH (n)
+            WHERE n.node_type = 'OSMWay'
+            SET n:OSMWay:POI
+        """)
+        print("? OSMWay:POI labels set")
+
+        # Tag label — from Code 3: tag nodes linked via TAGS relationship
+        tx.run("""
+            MATCH (n)
+            WHERE n.node_type = 'Tag'
+            SET n:Tag
+        """)
+        print("? Tag labels set")
+
+        # RoadOsm label — from Code 5: dual graph nodes
+        # These are imported from dual_nodes.csv and have node_type='RoadOsm' or
+        # they have a 'name' and 'status' and 'osmway_ids' property set by dual graph generator
+        tx.run("""
+            MATCH (n)
+            WHERE n.node_type = 'RoadOsm'
+            SET n:RoadOsm
+        """)
+        print("? RoadOsm labels set")
+
+    # =========================================================================
+    # STEP 2: Location — from Code 1 and Code 3
+    # =========================================================================
+    def set_location(self):
+        with self.driver.session() as session:
+            session.execute_write(self._set_location)
+
+    @staticmethod
+    def _set_location(tx):
+        # Location for RoadJunction — from Code 1: set_location()
+        tx.run("""
+            MATCH (n:RoadJunction)
+            WHERE n.y IS NOT NULL AND n.x IS NOT NULL
+            SET n.location = point({latitude: toFloat(n.y), longitude: toFloat(n.x)}),
+                n.lat = toFloat(n.y),
+                n.lon = toFloat(n.x),
+                n.geometry = 'POINT(' + n.y + ' ' + n.x + ')'
+        """)
+        print("? RoadJunction locations set")
+
+        # Location for OSMNode — from Code 3: set_location()
+        tx.run("""
+            MATCH (n:OSMNode)
+            WHERE n.lat IS NOT NULL AND n.lon IS NOT NULL
+            SET n.location = point({latitude: toFloat(n.lat), longitude: toFloat(n.lon)})
+        """)
+        print("? OSMNode locations set")
+
+    # =========================================================================
+    # STEP 3: Distance — from Code 1
+    # =========================================================================
+    def set_distance(self):
+        with self.driver.session() as session:
+            session.execute_write(self._set_distance)
+
+    @staticmethod
+    def _set_distance(tx):
+        # Distance on ROUTE relationships — from Code 1: set_distance()
+        tx.run("""
+            MATCH (n:RoadJunction)-[r:ROUTE]-()
+            SET r.distance = toFloat(r.length), r.status = 'active'
+        """)
+        print("? ROUTE distances set")
+
+        # Distance on NEAR relationships
+        tx.run("""
+            MATCH ()-[r:NEAR]-()
+            SET r.distance = toFloat(r.distance)
+        """)
+        print("? NEAR distances set")
+
+    # =========================================================================
+    # STEP 4: Driveable — from Code 3: mark_driveable_roadjunctions()
+    # =========================================================================
+    def mark_driveable(self):
+        with self.driver.session() as session:
+            session.execute_write(self._mark_driveable)
+
+    @staticmethod
+    def _mark_driveable(tx):
+        # Normalize driveable string to boolean on ROUTE edges
+        tx.run("""
+            MATCH ()-[r:ROUTE]-()
+            WHERE r.driveable = 'True' OR r.driveable = 'true'
+            SET r.driveable = true
+        """)
+
+        # Mark all RoadJunction as not driveable first
+        tx.run("""
+            MATCH (n:RoadJunction)
+            SET n.driveable = false
+        """)
+
+        # Mark driveable RoadJunctions — those connected to driveable ROUTE edges
+        tx.run("""
+            MATCH (n:RoadJunction)-[r:ROUTE]-()
+            WHERE r.driveable = true
+            SET n.driveable = true
+        """)
+        print("? Driveable junctions marked")
+
+    # =========================================================================
+    # STEP 5: Indexes — from Code 1, Code 3, Code 5
+    # =========================================================================
+    def set_indexes(self):
+        with self.driver.session() as session:
+            session.execute_write(self._set_indexes)
+
+    @staticmethod
+    def _set_indexes(tx):
+        # From Code 1: index on RoadJunction
+        tx.run("CREATE INDEX IF NOT EXISTS FOR (n:RoadJunction) ON (n.osmnode_id)")
+        print("? Index on RoadJunction.osmnode_id")
+
+        # From Code 3: index on OSMNode
+        tx.run("CREATE INDEX IF NOT EXISTS FOR (n:OSMNode) ON (n.osm_id)")
+        print("? Index on OSMNode.osm_id")
+
+        # From Code 3: index on POI
+        tx.run("CREATE INDEX IF NOT EXISTS FOR (n:POI) ON (n.osm_id)")
+        print("? Index on POI.osm_id")
+
+        # From Code 5: index on RoadOsm
+        tx.run("CREATE INDEX IF NOT EXISTS FOR (n:RoadOsm) ON (n.name)")
+        print("? Index on RoadOsm.name")
+
+    # =========================================================================
+    # STEP 6: Spatial Layer — from Code 1: generate_spatial_layer + import_nodes
+    # =========================================================================
+    def generate_spatial_layer(self):
+        with self.driver.session() as session:
+            session.execute_write(self._generate_spatial_layer)
+
+    @staticmethod
+    def _generate_spatial_layer(tx):
+        # Check if spatial layer already exists
+        result = tx.run("""
+            CALL spatial.layers()
+        """)
+        layers = result.values()
+        if len(layers) == 0:
+            tx.run("""
+                CALL spatial.addWKTLayer('spatial', 'geometry')
+            """)
+            print("? Spatial layer created")
+        else:
+            print("? Spatial layer already exists")
+
+    def import_nodes_in_spatial_layer(self):
+        with self.driver.session() as session:
+            session.execute_write(self._import_nodes_in_spatial_layer)
+
+    @staticmethod
+    def _import_nodes_in_spatial_layer(tx):
+        # Import RoadJunction nodes into spatial layer — from Code 1
+        result = tx.run("""
+            MATCH (n:RoadJunction)
+            WHERE n.geometry IS NOT NULL
+            CALL spatial.addNode('spatial', n) YIELD node
+            RETURN count(node) as total
+        """)
+        count = result.single()['total']
+        print(f"? Imported {count} RoadJunction nodes into spatial layer")
+
+        # Import OSMNode nodes into spatial layer — from Code 3
+        result = tx.run("""
+            MATCH (n:OSMNode)
+            WHERE n.geometry IS NOT NULL
+            CALL spatial.addNode('spatial', n) YIELD node
+            RETURN count(node) as total
+        """)
+        count = result.single()['total']
+        print(f"? Imported {count} OSMNode nodes into spatial layer")
+
+
+def add_options():
+    parser = argparse.ArgumentParser(description='Post-import setup for Neo4j graph database.')
+    parser.add_argument('--neo4jURL', '-n', dest='neo4jURL', type=str,
+                        default='bolt://localhost:7687',
+                        help='Neo4j bolt URL (default: bolt://localhost:7687)')
+    parser.add_argument('--neo4juser', '-u', dest='neo4juser', type=str,
+                        default='neo4j',
+                        help='Neo4j username (default: neo4j)')
+    parser.add_argument('--neo4jpwd', '-p', dest='neo4jpwd', type=str,
+                        required=True,
+                        help='Neo4j password')
+    return parser
+
+
+def main(args=None):
+    argParser = add_options()
+    options = argParser.parse_args(args=args)
+
+    greeter = App(options.neo4jURL, options.neo4juser, options.neo4jpwd)
+    try:
+        print("\n=== Running post-import steps ===\n")
+
+        print("Step 1: Setting labels...")
+        greeter.set_labels()
+
+        print("\nStep 2: Setting locations...")
+        greeter.set_location()
+
+        print("\nStep 3: Setting distances...")
+        greeter.set_distance()
+
+        print("\nStep 4: Marking driveable junctions...")
+        greeter.mark_driveable()
+
+        print("\nStep 5: Creating indexes...")
+        greeter.set_indexes()
+
+        print("\nStep 6: Setting up spatial layer...")
+        greeter.generate_spatial_layer()
+        greeter.import_nodes_in_spatial_layer()
+
+        print("\n=== Post-import steps completed successfully! ===")
+    except Exception as e:
+        print(f"Error during post-import: {e}")
+        raise
+    finally:
+        greeter.close()
+
+
+if __name__ == "__main__":
+    main()
