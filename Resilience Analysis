@@ -36,9 +36,7 @@ class ResilienceAnalyzer:
     def close(self):
         self.driver.close()
 
-    # ==========================================================
-    # PROJECTIONS
-    # ==========================================================
+
     def create_directed_projection(self, graph_name):
         """Directed projection (excludes closed roads)."""
         with self.driver.session() as session:
@@ -96,9 +94,6 @@ class ResilienceAnalyzer:
             except Exception:
                 pass
 
-    # ==========================================================
-    # CLOSURE MANAGEMENT
-    # ==========================================================
     def apply_closure(self, road_names):
         """Mark roads as closed."""
         if not road_names:
@@ -119,9 +114,7 @@ class ResilienceAnalyzer:
                 REMOVE n.temp_status
             """)
 
-    # ==========================================================
-    # PAGERANK (for ranking roads before closure)
-    # ==========================================================
+
     def calculate_pagerank(self, graph_name):
         with self.driver.session() as session:
             result = session.run(f"""
@@ -135,9 +128,6 @@ class ResilienceAnalyzer:
             """)
             return pd.DataFrame([dict(r) for r in result])
 
-    # ==========================================================
-    # 10 RESILIENCE METRICS
-    # ==========================================================
     def calculate_scenario_metrics(self, dir_graph, undir_graph):
         """Compute all 10 metrics for one scenario."""
         metrics = {}
@@ -328,9 +318,6 @@ class ResilienceAnalyzer:
         return metrics
 
 
-# ============================================================
-# HISTOGRAMS
-# ============================================================
 def create_histograms(all_results, output_dir):
     print("\n  Creating histograms...")
     os.makedirs(output_dir, exist_ok=True)
@@ -370,9 +357,6 @@ def create_histograms(all_results, output_dir):
         print(f"    ✓ hist_{safe}.png")
 
 
-# ============================================================
-# MAIN
-# ============================================================
 def main():
     parser = argparse.ArgumentParser(description='Road Closure Resilience Analysis')
     parser.add_argument('--neo4jURL', '-n', required=True)
