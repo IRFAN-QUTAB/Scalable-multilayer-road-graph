@@ -1,0 +1,794 @@
+import overpy
+import json
+import argparse
+import os
+import time
+import math
+import pandas as pd
+import networkx as nx
+from typing import List, Tuple, Dict
+import threading
+from scipy.spatial import KDTree
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+class NetworkXPOIGenerator:
+    def __init__(self, nodes_csv: str, rels_csv: str, output_folder: str, overpass_url: str = None,
+                 max_workers: int = 4):
+        self.nodes_csv = nodes_csv
+        self.rels_csv = rels_csv
+        self.output_folder = output_folder
+
+        if overpass_url:
+            self.overpass_api = overpy.Overpass(url=overpass_url)
+            print(f"Using custom Overpass API at: {overpass_url}")
+        else:
+            self.overpass_api = overpy.Overpass()
+            print("Using default Overpass API")
+
+        self.max_workers = max_workers
+        self.rate_limit_lock = threading.Lock()
+        self.data_lock = threading.Lock()
+        self.last_api_call = 0
+        self.min_api_interval = 5.0
+        self.max_retries = 5
+        self.G = None
+
+        # Separate lists for different node types
+        self.osmnode_poi_nodes = []    # OSMNode:POI (node-based amenities)
+        self.osmnode_way_nodes = []    # OSMNode (way member nodes, no POI label)
+        self.osmway_poi_nodes = []     # OSMWay:POI (way-based amenities)
+        self.tag_nodes = []            # Tag nodes
+
+        # Separate lists for different edge types
+        self.near_edges = []           # NEAR: OSMNode -> RoadJunction
+        self.part_of_edges = []        # PART_OF: OSMNode -> OSMWay
+        self.tags_edges = []           # TAGS: POI -> Tag
+
+        if not os.path.exists(self.output_folder):
+            os.makedirs(self.output_folder)
+
+    def _flatten_value(self, value):
+        """Flatten list values and clean problematic characters for CSV"""
+        if isinstance(value, list):
+            value = ";".join(str(v) for v in value)
+        if isinstance(value, str):
+            value = value.replace('\n', ' ').replace('\r', ' ')
+            value = value.replace('"', "'")
+        return value
+
+    NUMERIC_DOUBLE_FIELDS = {'lat', 'lon', 'x', 'y', 'distance', 'length', 'street_count'}
+    NUMERIC_LONG_FIELDS = set()
+
+    def _build_neo4j_header(self, df, id_col=None, id_space=None,
+                            start_id_col=None, end_id_col=None,
+                            start_id_space=None, end_id_space=None):
+        """Build neo4j-admin import compatible header from DataFrame columns"""
+        headers = []
+        for col in df.columns:
+            if id_col and col == id_col:
+                if id_space:
+                    headers.append(f'{col}:ID({id_space})')
+                else:
+                    headers.append('id:ID')
+            elif start_id_col and col == start_id_col:
+                if start_id_space:
+                    headers.append(f':START_ID({start_id_space})')
+                else:
+                    headers.append(':START_ID')
+            elif end_id_col and col == end_id_col:
+                if end_id_space:
+                    headers.append(f':END_ID({end_id_space})')
+                else:
+                    headers.append(':END_ID')
+            elif col == 'edge_type':
+                headers.append(':TYPE')
+            elif col in self.NUMERIC_DOUBLE_FIELDS:
+                headers.append(f"{col}:DOUBLE")
+            elif col in self.NUMERIC_LONG_FIELDS:
+                headers.append(f"{col}:LONG")
+            else:
+                headers.append(f"{col}:STRING")
+        return headers
+
+    def _save_csv_with_neo4j_headers(self, df, filepath,
+                                     id_col=None, id_space=None,
+                                     start_id_col=None, end_id_col=None,
+                                     start_id_space=None, end_id_space=None):
+        """Save DataFrame as CSV with neo4j-admin import headers"""
+        headers = self._build_neo4j_header(df, id_col=id_col, id_space=id_space,
+                                           start_id_col=start_id_col, end_id_col=end_id_col,
+                                           start_id_space=start_id_space, end_id_space=end_id_space)
+        with open(filepath, 'w', newline='') as f:
+            f.write(','.join(headers) + '\n')
+
+        for col in df.columns:
+            df[col] = df[col].apply(
+                lambda v: str(v).replace('\n', ' ').replace('\r', ' ').replace('"', "'") if isinstance(v, str) else v)
+
+        df.to_csv(filepath, mode='a', index=False, header=False)
+
+    def load_graph_from_csv(self):
+        """Load the road graph from CSV files into NetworkX"""
+        print("Loading road graph from CSV files...")
+
+        nodes_df = pd.read_csv(self.nodes_csv)
+        print(f"Loaded {len(nodes_df)} road nodes")
+
+        rels_df = pd.read_csv(self.rels_csv)
+        print(f"Loaded {len(rels_df)} road relationships")
+
+        self.G = nx.MultiDiGraph()
+
+        for _, row in nodes_df.iterrows():
+            node_id = row['osmnode_id']
+            node_attrs = {'node_type': 'RoadJunction'}
+            for col in nodes_df.columns:
+                if col != 'osmnode_id':
+                    node_attrs[col] = row.get(col)
+            if 'lat' not in node_attrs and 'y' in node_attrs:
+                node_attrs['lat'] = node_attrs['y']
+            if 'lon' not in node_attrs and 'x' in node_attrs:
+                node_attrs['lon'] = node_attrs['x']
+            node_attrs['driveable'] = None
+            self.G.add_node(node_id, **node_attrs)
+
+        for _, row in rels_df.iterrows():
+            edge_attrs = {}
+            for col in rels_df.columns:
+                if col not in ('source_id', 'target_id'):
+                    edge_attrs[col] = row.get(col)
+            self.G.add_edge(row['source_id'], row['target_id'], **edge_attrs)
+
+        print(f"Graph loaded: {self.G.number_of_nodes()} nodes, {self.G.number_of_edges()} edges")
+        self.mark_driveable_roadjunctions()
+
+    def mark_driveable_roadjunctions(self):
+        """Mark which road junctions are connected to driveable routes"""
+        print("Marking driveable road junctions...")
+
+        for node in self.G.nodes():
+            self.G.nodes[node]['driveable'] = False
+
+        for u, v, key, data in self.G.edges(keys=True, data=True):
+            driveable = data.get('driveable')
+            if driveable == 'True' or driveable == 'true' or driveable is True:
+                self.G.nodes[u]['driveable'] = True
+                self.G.nodes[v]['driveable'] = True
+
+        driveable_count = sum(1 for n in self.G.nodes() if self.G.nodes[n]['driveable'])
+        print(f"Marked {driveable_count} driveable road junctions")
+
+    def build_spatial_index(self):
+        """Build KD-tree for efficient spatial queries"""
+        print("Building spatial index...")
+
+        self.driveable_nodes = []
+        self.driveable_coords = []
+        self.non_driveable_nodes = []
+        self.non_driveable_coords = []
+
+        for node, data in self.G.nodes(data=True):
+            if data.get('node_type') == 'RoadJunction':
+                lat = data.get('lat')
+                lon = data.get('lon')
+                if lat is not None and lon is not None:
+                    try:
+                        lat = float(lat)
+                        lon = float(lon)
+                    except (ValueError, TypeError):
+                        continue
+                    if data.get('driveable'):
+                        self.driveable_nodes.append(node)
+                        self.driveable_coords.append([lat, lon])
+                    else:
+                        self.non_driveable_nodes.append(node)
+                        self.non_driveable_coords.append([lat, lon])
+
+        if self.driveable_coords:
+            self.driveable_tree = KDTree(self.driveable_coords)
+            print(f"Built spatial index for {len(self.driveable_coords)} driveable nodes")
+        else:
+            self.driveable_tree = None
+            print("No driveable nodes found")
+
+        if self.non_driveable_coords:
+            self.non_driveable_tree = KDTree(self.non_driveable_coords)
+            print(f"Built spatial index for {len(self.non_driveable_coords)} non-driveable nodes")
+        else:
+            self.non_driveable_tree = None
+
+    @staticmethod
+    def haversine_distance(lat1, lon1, lat2, lon2):
+        R = 6371000
+        phi1 = math.radians(lat1)
+        phi2 = math.radians(lat2)
+        delta_phi = math.radians(lat2 - lat1)
+        delta_lambda = math.radians(lon2 - lon1)
+        a = (math.sin(delta_phi / 2) ** 2 +
+             math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2)
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        return R * c
+
+    def find_nearest_roadjunction(self, poi_lat, poi_lon):
+        """Find nearest road junction for a node using spatial index"""
+        connections = []
+
+        if self.driveable_tree:
+            indices = self.driveable_tree.query_ball_point([poi_lat, poi_lon], r=0.0009)
+            if indices:
+                candidates = []
+                for idx in indices:
+                    rj_node = self.driveable_nodes[idx]
+                    rj_lat, rj_lon = self.driveable_coords[idx]
+                    dist = self.haversine_distance(poi_lat, poi_lon, rj_lat, rj_lon)
+                    if dist <= 100:
+                        candidates.append((rj_node, dist, 'driveable_within_100m'))
+                if candidates:
+                    nearest = min(candidates, key=lambda x: x[1])
+                    connections.append(nearest)
+
+        if not connections and self.non_driveable_tree:
+            dist, idx = self.non_driveable_tree.query([poi_lat, poi_lon])
+            if idx < len(self.non_driveable_nodes):
+                rj_node = self.non_driveable_nodes[idx]
+                rj_lat, rj_lon = self.non_driveable_coords[idx]
+                actual_dist = self.haversine_distance(poi_lat, poi_lon, rj_lat, rj_lon)
+                connections.append((rj_node, actual_dist, 'nearest_non_driveable'))
+
+        if not connections and self.driveable_tree:
+            dist, idx = self.driveable_tree.query([poi_lat, poi_lon])
+            if idx < len(self.driveable_nodes):
+                rj_node = self.driveable_nodes[idx]
+                rj_lat, rj_lon = self.driveable_coords[idx]
+                actual_dist = self.haversine_distance(poi_lat, poi_lon, rj_lat, rj_lon)
+                connections.append((rj_node, actual_dist, 'nearest_driveable'))
+
+        return connections
+
+    @staticmethod
+    def km_to_degrees(km_lat, km_lon, reference_lat):
+        degrees_lat = km_lat / 111.32
+        degrees_lon = km_lon / (111.32 * math.cos(math.radians(reference_lat)))
+        return degrees_lat, degrees_lon
+
+    def get_processed_sections(self):
+        processed_file = os.path.join(self.output_folder, "processed_poi_sections.txt")
+        processed_sections = set()
+        if os.path.exists(processed_file):
+            with open(processed_file, 'r') as f:
+                for line in f:
+                    try:
+                        processed_sections.add(int(line.strip()))
+                    except ValueError:
+                        continue
+        return processed_sections
+
+    def save_processed_section(self, section_num):
+        processed_file = os.path.join(self.output_folder, "processed_poi_sections.txt")
+        with self.data_lock:
+            with open(processed_file, 'a') as f:
+                f.write(f"{section_num}\n")
+
+    def calculate_grid_points(self, center_lat, center_lon, total_distance_km, area_size_km):
+        points = []
+        step_size_km = area_size_km
+        steps_needed = math.ceil(total_distance_km / step_size_km)
+        start_offset_km = -(steps_needed - 1) * step_size_km / 2
+        for i in range(steps_needed):
+            for j in range(steps_needed):
+                offset_lat_km = start_offset_km + i * step_size_km
+                offset_lon_km = start_offset_km + j * step_size_km
+                deg_lat, deg_lon = self.km_to_degrees(offset_lat_km, offset_lon_km, center_lat)
+                new_lat = center_lat + deg_lat
+                new_lon = center_lon + deg_lon
+                points.append((new_lat, new_lon))
+        return points
+
+    def rate_limited_overpass_query(self, query):
+        with self.rate_limit_lock:
+            current_time = time.time()
+            time_since_last = current_time - self.last_api_call
+            if time_since_last < self.min_api_interval:
+                time.sleep(self.min_api_interval - time_since_last)
+            result = self.overpass_api.query(query)
+            self.last_api_call = time.time()
+            return result
+
+    def query_section_data(self, lat, lon, area_size_km, section_num):
+        delta_lat, delta_lon = self.km_to_degrees(area_size_km, area_size_km, lat)
+        min_lat = lat - delta_lat
+        max_lat = lat + delta_lat
+        min_lon = lon - delta_lon
+        max_lon = lon + delta_lon
+
+        query = f"""
+            [out:json][timeout:90];
+            (
+              node["amenity"]({min_lat},{min_lon},{max_lat},{max_lon});
+              way["amenity"]({min_lat},{min_lon},{max_lat},{max_lon});
+            );
+            (._;>;);
+            out body;
+        """
+
+        for attempt in range(self.max_retries):
+            try:
+                return self.rate_limited_overpass_query(query)
+            except Exception as e:
+                error_msg = str(e)
+                if "Server load too high" in error_msg or "timeout" in error_msg.lower():
+                    wait_time = min(300, (2 ** attempt) * 10)
+                    print(f"Section {section_num} - Attempt {attempt + 1}/{self.max_retries} failed: {error_msg}")
+                    if attempt < self.max_retries - 1:
+                        print(f"Waiting {wait_time} seconds before retry...")
+                        time.sleep(wait_time)
+                    else:
+                        raise
+                else:
+                    raise
+
+    def process_single_section(self, lat, lon, section_num, area_size_km):
+        """Process a single grid section - matching old schema exactly"""
+        try:
+            result = self.query_section_data(lat, lon, area_size_km, section_num)
+
+            section_osmnode_poi = []
+            section_osmnode_way = []
+            section_osmway_poi = []
+            section_tag_nodes = []
+            section_near_edges = []
+            section_part_of_edges = []
+            section_tags_edges = []
+
+            tag_counter = [0]  # mutable counter for thread safety
+
+            # --- Process Ways ---
+            way_node_ids = set()
+            for way in result.ways:
+                way_osm_id = way.id
+                way_node_id = f"way_{way_osm_id}"
+
+                # Create OSMWay:POI node (no lat/lon, just name and osm_id)
+                osmway_data = {
+                    'osmnode_id': way_node_id,
+                    'osm_id': way_osm_id,
+                    'node_type': 'OSMWay',
+                    'poi_type': 'OSMWay',
+                    'name': way.tags.get('name'),
+                    'amenity': way.tags.get('amenity'),
+                }
+                section_osmway_poi.append(osmway_data)
+
+                # Create Tag node for this way
+                tag_id = f"tag_way_{way_osm_id}"
+                tag_data = {'osmnode_id': tag_id, 'node_type': 'Tag'}
+                for tag_key, tag_value in way.tags.items():
+                    tag_data[tag_key] = self._flatten_value(tag_value)
+                section_tag_nodes.append(tag_data)
+
+                # TAGS relationship: OSMWay -> Tag
+                section_tags_edges.append({
+                    'source_id': way_node_id,
+                    'target_id': tag_id,
+                    'edge_type': 'TAGS',
+                })
+
+                # Create OSMNode for each member node of the way
+                for node in way.get_nodes(resolve_missing=False):
+                    node_osm_id = node.id
+                    way_node_ids.add(node_osm_id)
+                    member_node_id = f"node_{node_osm_id}"
+
+                    osmnode_data = {
+                        'osmnode_id': member_node_id,
+                        'osm_id': node_osm_id,
+                        'node_type': 'OSMNode',
+                        'poi_type': '',
+                        'lat': float(node.lat),
+                        'lon': float(node.lon),
+                        'geometry': f'POINT({node.lat} {node.lon})',
+                    }
+                    section_osmnode_way.append(osmnode_data)
+
+                    # PART_OF relationship: OSMNode -> OSMWay
+                    section_part_of_edges.append({
+                        'source_id': member_node_id,
+                        'target_id': way_node_id,
+                        'edge_type': 'PART_OF',
+                    })
+
+                    # NEAR relationship: OSMNode -> nearest RoadJunction
+                    connections = self.find_nearest_roadjunction(float(node.lat), float(node.lon))
+                    for rj_node, distance, status in connections:
+                        section_near_edges.append({
+                            'source_id': member_node_id,
+                            'target_id': rj_node,
+                            'edge_type': 'NEAR',
+                            'distance': distance,
+                            'status': status,
+                        })
+
+            # --- Process standalone Nodes (amenity nodes not part of any way) ---
+            for node in result.nodes:
+                if node.id not in way_node_ids and node.tags.get('amenity'):
+                    node_osm_id = node.id
+                    poi_node_id = f"node_{node_osm_id}"
+
+                    # Create OSMNode:POI node
+                    osmnode_poi_data = {
+                        'osmnode_id': poi_node_id,
+                        'osm_id': node_osm_id,
+                        'node_type': 'OSMNode',
+                        'poi_type': 'OSMNode',
+                        'lat': float(node.lat),
+                        'lon': float(node.lon),
+                        'geometry': f'POINT({node.lat} {node.lon})',
+                        'name': node.tags.get('name'),
+                        'amenity': node.tags.get('amenity'),
+                    }
+                    section_osmnode_poi.append(osmnode_poi_data)
+
+                    # Create Tag node
+                    tag_id = f"tag_node_{node_osm_id}"
+                    tag_data = {'osmnode_id': tag_id, 'node_type': 'Tag'}
+                    for tag_key, tag_value in node.tags.items():
+                        tag_data[tag_key] = self._flatten_value(tag_value)
+                    section_tag_nodes.append(tag_data)
+
+                    # TAGS relationship: OSMNode:POI -> Tag
+                    section_tags_edges.append({
+                        'source_id': poi_node_id,
+                        'target_id': tag_id,
+                        'edge_type': 'TAGS',
+                    })
+
+                    # NEAR relationship: OSMNode -> nearest RoadJunction
+                    connections = self.find_nearest_roadjunction(float(node.lat), float(node.lon))
+                    for rj_node, distance, status in connections:
+                        section_near_edges.append({
+                            'source_id': poi_node_id,
+                            'target_id': rj_node,
+                            'edge_type': 'NEAR',
+                            'distance': distance,
+                            'status': status,
+                        })
+
+            # Thread-safe append to main lists
+            with self.data_lock:
+                self.osmnode_poi_nodes.extend(section_osmnode_poi)
+                self.osmnode_way_nodes.extend(section_osmnode_way)
+                self.osmway_poi_nodes.extend(section_osmway_poi)
+                self.tag_nodes.extend(section_tag_nodes)
+                self.near_edges.extend(section_near_edges)
+                self.part_of_edges.extend(section_part_of_edges)
+                self.tags_edges.extend(section_tags_edges)
+
+            total_pois = len(section_osmnode_poi) + len(section_osmway_poi)
+            total_osmnode_way = len(section_osmnode_way)
+            total_edges = len(section_near_edges) + len(section_part_of_edges) + len(section_tags_edges)
+            print(f"Section {section_num}: {total_pois} POIs, {total_osmnode_way} way-member nodes, {total_edges} relationships")
+
+            return True
+
+        except Exception as e:
+            print(f"Section {section_num} failed with error: {e}")
+            return False
+
+    def apply_connection_strategies(self):
+        """Apply connection strategies for OSMNodes without NEAR connections"""
+        print("\nApplying connection strategies...")
+
+        if not self.driveable_tree or not self.driveable_nodes:
+            print("No driveable junctions available; skipping")
+            return
+
+        # Collect all OSMNodes (both POI and way-member) that need connections
+        all_osmnodes = self.osmnode_poi_nodes + self.osmnode_way_nodes
+        connected = set(e['source_id'] for e in self.near_edges if e.get('edge_type') == 'NEAR')
+
+        step1 = step2 = step3 = 0
+
+        # Step 1: Nearest driveable within 100m
+        for node in all_osmnodes:
+            nid = node['osmnode_id']
+            if nid in connected:
+                continue
+            lat, lon = node.get('lat'), node.get('lon')
+            if lat is None or lon is None:
+                continue
+            if self.driveable_tree:
+                indices = self.driveable_tree.query_ball_point([lat, lon], r=0.0009)
+                if indices:
+                    candidates = []
+                    for idx in indices:
+                        rj = self.driveable_nodes[idx]
+                        rlat, rlon = self.driveable_coords[idx]
+                        d = self.haversine_distance(lat, lon, rlat, rlon)
+                        if d <= 100:
+                            candidates.append((rj, d))
+                    if candidates:
+                        nearest = min(candidates, key=lambda x: x[1])
+                        self.near_edges.append({
+                            'source_id': nid, 'target_id': nearest[0],
+                            'edge_type': 'NEAR', 'distance': nearest[1],
+                            'status': 'driveable_within_100m',
+                        })
+                        connected.add(nid)
+                        step1 += 1
+
+        # Step 2: Nearest non-driveable
+        if self.non_driveable_tree:
+            for node in all_osmnodes:
+                nid = node['osmnode_id']
+                if nid in connected:
+                    continue
+                lat, lon = node.get('lat'), node.get('lon')
+                if lat is None or lon is None:
+                    continue
+                dist, idx = self.non_driveable_tree.query([lat, lon])
+                if idx < len(self.non_driveable_nodes):
+                    rj = self.non_driveable_nodes[idx]
+                    rlat, rlon = self.non_driveable_coords[idx]
+                    d = self.haversine_distance(lat, lon, rlat, rlon)
+                    self.near_edges.append({
+                        'source_id': nid, 'target_id': rj,
+                        'edge_type': 'NEAR', 'distance': d,
+                        'status': 'nearest_non_driveable',
+                    })
+                    connected.add(nid)
+                    step2 += 1
+
+        # Step 3: If connected only to non-driveable, also connect to nearest driveable
+        edges_by_src = {}
+        for e in self.near_edges:
+            if e.get('edge_type') == 'NEAR':
+                edges_by_src.setdefault(e['source_id'], []).append(e)
+
+        for node in all_osmnodes:
+            nid = node['osmnode_id']
+            edges = edges_by_src.get(nid, [])
+            if not edges:
+                continue
+            has_drv = any(self.G.nodes.get(e['target_id'], {}).get('driveable') for e in edges if e['target_id'] in self.G.nodes)
+            has_nondrv = any(not self.G.nodes.get(e['target_id'], {}).get('driveable') for e in edges if e['target_id'] in self.G.nodes)
+            if has_nondrv and not has_drv:
+                lat, lon = node.get('lat'), node.get('lon')
+                if lat is None or lon is None:
+                    continue
+                dist, idx = self.driveable_tree.query([lat, lon])
+                if idx < len(self.driveable_nodes):
+                    rj = self.driveable_nodes[idx]
+                    rlat, rlon = self.driveable_coords[idx]
+                    d = self.haversine_distance(lat, lon, rlat, rlon)
+                    self.near_edges.append({
+                        'source_id': nid, 'target_id': rj,
+                        'edge_type': 'NEAR', 'distance': d,
+                        'status': 'nearest_driveable_from_non_driveable',
+                    })
+                    step3 += 1
+
+        print(f"Step 1: {step1}, Step 2: {step2}, Step 3: {step3}")
+        print(f"Total connections: {step1 + step2 + step3}")
+
+    def export_to_csv(self):
+        """Export all data to CSV files with neo4j-admin headers"""
+        print("\nExporting data to CSV...")
+
+        # --- Deduplicate ---
+        def dedup(lst, key):
+            seen = set()
+            result = []
+            for item in lst:
+                k = item[key]
+                if k not in seen:
+                    seen.add(k)
+                    result.append(item)
+            return result
+
+        self.osmnode_poi_nodes = dedup(self.osmnode_poi_nodes, 'osmnode_id')
+        self.osmnode_way_nodes = dedup(self.osmnode_way_nodes, 'osmnode_id')
+        self.osmway_poi_nodes = dedup(self.osmway_poi_nodes, 'osmnode_id')
+        self.tag_nodes = dedup(self.tag_nodes, 'osmnode_id')
+
+        def dedup_edges(lst):
+            seen = set()
+            result = []
+            for item in lst:
+                k = (item['source_id'], item['target_id'], item.get('edge_type', ''))
+                if k not in seen:
+                    seen.add(k)
+                    result.append(item)
+            return result
+
+        self.near_edges = dedup_edges(self.near_edges)
+        self.part_of_edges = dedup_edges(self.part_of_edges)
+        self.tags_edges = dedup_edges(self.tags_edges)
+
+        # --- Combined Nodes: RoadJunction + OSMNode(POI) + OSMNode(way) + OSMWay + Tag ---
+        print("Creating combined nodes file...")
+        original_nodes_df = pd.read_csv(self.nodes_csv)
+
+        all_poi_nodes = self.osmnode_poi_nodes + self.osmnode_way_nodes + self.osmway_poi_nodes + self.tag_nodes
+
+        if all_poi_nodes:
+            poi_rows = []
+            for poi in all_poi_nodes:
+                row = {'osmnode_id': poi['osmnode_id']}
+                for col in original_nodes_df.columns:
+                    if col == 'osmnode_id':
+                        continue
+                    row[col] = poi.get(col, None)
+                # Add POI-specific fields
+                for key in ['node_type', 'poi_type', 'name', 'amenity', 'osm_id']:
+                    if key in poi:
+                        row[key] = poi[key]
+                # Add any extra tag properties
+                for key, value in poi.items():
+                    if key not in row:
+                        row[key] = value
+                poi_rows.append(row)
+
+            poi_df = pd.DataFrame(poi_rows)
+            combined_nodes_df = pd.concat([original_nodes_df, poi_df], ignore_index=True)
+        else:
+            combined_nodes_df = original_nodes_df
+
+        combined_nodes_file = os.path.join(self.output_folder, 'combined_nodes.csv')
+        self._save_csv_with_neo4j_headers(combined_nodes_df, combined_nodes_file,
+                                           id_col='osmnode_id', id_space='RoadJunction')
+        print(f"Exported {len(combined_nodes_df)} combined nodes")
+
+        # --- Combined Edges: ROUTE + NEAR + PART_OF + TAGS ---
+        print("Creating combined edges file...")
+        original_rels_df = pd.read_csv(self.rels_csv)
+
+        all_poi_edges = self.near_edges + self.part_of_edges + self.tags_edges
+
+        if all_poi_edges:
+            edge_rows = []
+            for edge in all_poi_edges:
+                row = {'source_id': edge['source_id'], 'target_id': edge['target_id']}
+                for col in original_rels_df.columns:
+                    if col in ('source_id', 'target_id'):
+                        continue
+                    row[col] = edge.get(col, None)
+                row['edge_type'] = edge.get('edge_type')
+                row['distance'] = edge.get('distance')
+                row['status'] = edge.get('status')
+                edge_rows.append(row)
+
+            poi_edges_df = pd.DataFrame(edge_rows)
+            combined_edges_df = pd.concat([original_rels_df, poi_edges_df], ignore_index=True)
+        else:
+            combined_edges_df = original_rels_df
+
+        if 'edge_type' in combined_edges_df.columns:
+            combined_edges_df['edge_type'] = combined_edges_df['edge_type'].fillna('ROUTE')
+
+        combined_edges_file = os.path.join(self.output_folder, 'combined_edges.csv')
+        self._save_csv_with_neo4j_headers(combined_edges_df, combined_edges_file,
+                                           start_id_col='source_id', end_id_col='target_id',
+                                           start_id_space='RoadJunction', end_id_space='RoadJunction')
+        print(f"Exported {len(combined_edges_df)} combined edges")
+
+        # --- Summary ---
+        print(f"\nSummary:")
+        print(f"  OSMNode:POI nodes: {len(self.osmnode_poi_nodes)}")
+        print(f"  OSMNode (way members): {len(self.osmnode_way_nodes)}")
+        print(f"  OSMWay:POI nodes: {len(self.osmway_poi_nodes)}")
+        print(f"  Tag nodes: {len(self.tag_nodes)}")
+        print(f"  NEAR edges: {len(self.near_edges)}")
+        print(f"  PART_OF edges: {len(self.part_of_edges)}")
+        print(f"  TAGS edges: {len(self.tags_edges)}")
+
+    def generate_large_area_poi(self, center_lat, center_lon, total_distance_km, area_size_km):
+        """Main method"""
+        print("Large area POI generation...")
+        print(f"Center: ({center_lat}, {center_lon})")
+        print(f"Total area: {total_distance_km}km, Section size: {area_size_km}km")
+        print(f"Max parallel workers: {self.max_workers}")
+
+        self.load_graph_from_csv()
+        self.build_spatial_index()
+
+        grid_points = self.calculate_grid_points(center_lat, center_lon, total_distance_km, area_size_km)
+        processed_sections = self.get_processed_sections()
+        print(f"Found {len(processed_sections)} previously processed sections")
+
+        sections_to_process = [
+            (i, lat, lon) for i, (lat, lon) in enumerate(grid_points, 1)
+            if i not in processed_sections
+        ]
+        print(f"Will process {len(sections_to_process)} new sections out of {len(grid_points)} total")
+
+        try:
+            batch_size = 10
+            total_sections = len(sections_to_process)
+
+            for batch_start in range(0, total_sections, batch_size):
+                batch_end = min(batch_start + batch_size, total_sections)
+                batch = sections_to_process[batch_start:batch_end]
+
+                print(f"\n=== Processing batch {batch_start // batch_size + 1} "
+                      f"(sections {batch_start + 1} to {batch_end}) ===")
+
+                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    future_to_section = {
+                        executor.submit(self.process_single_section, lat, lon, i, area_size_km): (i, lat, lon)
+                        for i, lat, lon in batch
+                    }
+                    for future in as_completed(future_to_section):
+                        section_num = future_to_section[future][0]
+                        try:
+                            if future.result():
+                                self.save_processed_section(section_num)
+                        except Exception as e:
+                            print(f"Section {section_num} exception: {e}")
+
+                self.apply_connection_strategies()
+
+            print("\n=== Final post-processing ===")
+            self.apply_connection_strategies()
+
+            total_pois = len(self.osmnode_poi_nodes) + len(self.osmway_poi_nodes)
+            print(f"\n=== POI Collection Completed ===")
+            print(f"Total POIs: {total_pois}")
+            print(f"Total way-member nodes: {len(self.osmnode_way_nodes)}")
+            print(f"Total Tag nodes: {len(self.tag_nodes)}")
+
+            self.export_to_csv()
+            print(f"\n=== Export Completed Successfully ===")
+            print(f"Output folder: {self.output_folder}")
+
+        except Exception as e:
+            print(f"\n=== POI Generation Failed: {e} ===")
+            self.export_to_csv()
+            raise
+
+
+def add_options():
+    parser = argparse.ArgumentParser(description='Insertion of POI using NetworkX with parallel processing.')
+    parser.add_argument('--nodes-csv', '-n', dest='nodes_csv', type=str, required=True)
+    parser.add_argument('--rels-csv', '-r', dest='rels_csv', type=str, required=True)
+    parser.add_argument('--output', '-o', dest='output', type=str, required=True)
+    parser.add_argument('--latitude', '-x', dest='lat', type=float, required=True)
+    parser.add_argument('--longitude', '-y', dest='lon', type=float, required=True)
+    parser.add_argument('--distance', '-d', dest='dist', type=float, required=True)
+    parser.add_argument('--area-size', '-a', dest='area_size', type=float, required=True)
+    parser.add_argument('--overpass-url', '-u', dest='overpass_url', type=str, default=None)
+    parser.add_argument('--workers', '-w', dest='workers', type=int, default=4)
+    return parser
+
+
+def main(args=None):
+    start_time = time.time()
+    argParser = add_options()
+    options = argParser.parse_args(args=args)
+
+    generator = NetworkXPOIGenerator(
+        nodes_csv=options.nodes_csv,
+        rels_csv=options.rels_csv,
+        output_folder=options.output,
+        overpass_url=options.overpass_url,
+        max_workers=options.workers,
+    )
+
+    try:
+        generator.generate_large_area_poi(
+            center_lat=options.lat,
+            center_lon=options.lon,
+            total_distance_km=options.dist,
+            area_size_km=options.area_size,
+        )
+    except Exception as e:
+        print(f"Error: {e}")
+        raise
+
+    print(f"\nTotal execution time: {time.time() - start_time:.2f} seconds")
+    return 0
+
+
+if __name__ == "__main__":
+    main()
