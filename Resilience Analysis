@@ -1,0 +1,577 @@
+
+from neo4j import GraphDatabase
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import argparse
+from datetime import datetime
+import time
+import warnings
+
+warnings.filterwarnings("ignore")
+
+
+def setup_plot_style():
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.size": 11,
+        "axes.labelsize": 12,
+        "axes.titlesize": 13,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "legend.fontsize": 10,
+        "figure.dpi": 300,
+        "savefig.dpi": 300,
+        "savefig.bbox": "tight",
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+    })
+
+
+class ResilienceAnalyzer:
+    def __init__(self, uri, user, password):
+        self.driver = GraphDatabase.driver(uri, auth=(user, password))
+
+    def close(self):
+        self.driver.close()
+
+    # ==========================================================
+    # PROJECTIONS
+    # ==========================================================
+    def create_directed_projection(self, graph_name):
+        """Directed projection (excludes closed roads)."""
+        with self.driver.session() as session:
+            try:
+                session.run(f"CALL gds.graph.drop('{graph_name}', false)")
+            except Exception:
+                pass
+            session.run(f"""
+                CALL gds.graph.create.cypher(
+                    '{graph_name}',
+                    'MATCH (n:RoadOsm)
+                     WHERE n.status = "active" AND n.temp_status IS NULL
+                     RETURN id(n) AS id',
+                    'MATCH (n:RoadOsm)-[:CONNECTED]->(m:RoadOsm)
+                     WHERE n.status = "active" AND m.status = "active"
+                       AND n.temp_status IS NULL AND m.temp_status IS NULL
+                     RETURN id(n) AS source, id(m) AS target'
+                )
+            """)
+
+    def create_undirected_projection(self, graph_name):
+        """
+        True undirected projection (excludes closed roads).
+        Uses GDS native projection with orientation=UNDIRECTED.
+
+        NOTE: Native projection cannot filter by node properties directly.
+        We use cypher projection with deduped edges instead, which GDS
+        treats as directed but with symmetric edges = effectively undirected.
+        For CC and Louvain this gives correct results on bidirectional graphs.
+        """
+        with self.driver.session() as session:
+            try:
+                session.run(f"CALL gds.graph.drop('{graph_name}', false)")
+            except Exception:
+                pass
+            # Use cypher projection with both directions loaded
+            # Bidirectional graph → GDS sees symmetric directed = undirected equivalent
+            session.run(f"""
+                CALL gds.graph.create.cypher(
+                    '{graph_name}',
+                    'MATCH (n:RoadOsm)
+                     WHERE n.status = "active" AND n.temp_status IS NULL
+                     RETURN id(n) AS id',
+                    'MATCH (n:RoadOsm)-[:CONNECTED]->(m:RoadOsm)
+                     WHERE n.status = "active" AND m.status = "active"
+                       AND n.temp_status IS NULL AND m.temp_status IS NULL
+                     RETURN id(n) AS source, id(m) AS target'
+                )
+            """)
+
+    def drop_projection(self, graph_name):
+        with self.driver.session() as session:
+            try:
+                session.run(f"CALL gds.graph.drop('{graph_name}', false)")
+            except Exception:
+                pass
+
+    # ==========================================================
+    # CLOSURE MANAGEMENT
+    # ==========================================================
+    def apply_closure(self, road_names):
+        """Mark roads as closed."""
+        if not road_names:
+            return
+        with self.driver.session() as session:
+            session.run("""
+                UNWIND $roads AS road_name
+                MATCH (n:RoadOsm {name: road_name})
+                SET n.temp_status = 'closed'
+            """, roads=road_names)
+
+    def reset_closures(self):
+        """Remove all temp_status markers."""
+        with self.driver.session() as session:
+            session.run("""
+                MATCH (n:RoadOsm)
+                WHERE n.temp_status IS NOT NULL
+                REMOVE n.temp_status
+            """)
+
+    # ==========================================================
+    # PAGERANK (for ranking roads before closure)
+    # ==========================================================
+    def calculate_pagerank(self, graph_name):
+        with self.driver.session() as session:
+            result = session.run(f"""
+                CALL gds.pageRank.stream('{graph_name}', {{
+                    dampingFactor: 0.85
+                }})
+                YIELD nodeId, score
+                RETURN gds.util.asNode(nodeId).name AS road_name,
+                       score AS pagerank
+                ORDER BY score DESC
+            """)
+            return pd.DataFrame([dict(r) for r in result])
+
+    # ==========================================================
+    # 10 RESILIENCE METRICS
+    # ==========================================================
+    def calculate_scenario_metrics(self, dir_graph, undir_graph):
+        """Compute all 10 metrics for one scenario."""
+        metrics = {}
+
+        with self.driver.session() as session:
+            # 1. Diameter + 3. Avg Path Length (together)
+            print("      avg path + diameter...")
+            try:
+                result = session.run(f"""
+                    CALL gds.alpha.allShortestPaths.stream('{dir_graph}')
+                    YIELD distance
+                    WHERE distance < 9999999
+                    RETURN avg(distance) AS avg_path,
+                           max(distance) AS diameter,
+                           count(distance) AS pairs
+                """).single()
+                metrics['avg_path_length'] = result['avg_path'] if result else None
+                metrics['diameter'] = int(result['diameter']) if result and result['diameter'] else None
+            except Exception as e:
+                print(f"        ⚠ path/diameter failed: {e}")
+                metrics['avg_path_length'] = None
+                metrics['diameter'] = None
+
+            # 2. Connected Components (WCC)
+            print("      components...")
+            try:
+                result = session.run(f"""
+                    CALL gds.wcc.stats('{dir_graph}')
+                    YIELD componentCount
+                    RETURN componentCount
+                """).single()
+                metrics['connected_components'] = result['componentCount']
+            except Exception as e:
+                print(f"        ⚠ WCC failed: {e}")
+                metrics['connected_components'] = None
+
+            # 4. Avg Clustering Coefficient (standard)
+            print("      clustering (standard)...")
+            try:
+                result = session.run("""
+                    MATCH (a:RoadOsm)
+                    WHERE a.status = 'active' AND a.temp_status IS NULL
+
+                    OPTIONAL MATCH (a)-[:CONNECTED]-(neighbor:RoadOsm)
+                    WHERE neighbor.status = 'active' AND neighbor.temp_status IS NULL
+                    WITH a, count(DISTINCT neighbor) AS degree
+
+                    // Triangles sirf degree > 1 ke liye
+                    OPTIONAL MATCH (a)-[:CONNECTED]-(b:RoadOsm)-[:CONNECTED]-(c:RoadOsm)-[:CONNECTED]-(a)
+                    WHERE degree > 1
+                      AND b.status = 'active' AND b.temp_status IS NULL
+                      AND c.status = 'active' AND c.temp_status IS NULL
+                      AND id(b) < id(c)
+                    WITH a, degree, count(DISTINCT c) AS triangles
+
+                    // degree <= 1 ko 0.0 assign karo
+                    WITH CASE
+                           WHEN degree > 1
+                           THEN toFloat(2 * triangles) / (degree * (degree - 1))
+                           ELSE 0.0
+                         END AS local_cc
+                    RETURN avg(local_cc) AS avg_cc
+                """).single()
+                metrics['avg_clustering'] = result['avg_cc'] if result and result['avg_cc'] is not None else 0.0
+            except Exception as e:
+                print(f"        ⚠ CC failed: {e}")
+                metrics['avg_clustering'] = 0.0
+
+            # 5. Avg Clustering Coefficient (adapted, directed)
+            print("      clustering (adapted)...")
+            try:
+                result = session.run("""
+                    MATCH (a:RoadOsm)
+                    WHERE a.status = 'active' AND a.temp_status IS NULL
+
+                    OPTIONAL MATCH (a)-[:CONNECTED]-(neighbor:RoadOsm)
+                    WHERE neighbor.status = 'active' AND neighbor.temp_status IS NULL
+                    WITH a, count(DISTINCT neighbor) AS degree
+
+                    // degree <= 1 wale directly 0.0
+                    CALL {
+                        WITH a, degree
+                        WITH a, degree
+                        WHERE degree > 1
+                        MATCH (a)-[:CONNECTED]-(neighbor:RoadOsm)
+                        WHERE neighbor.status = 'active' AND neighbor.temp_status IS NULL
+                        WITH a, degree, collect(DISTINCT neighbor) AS neighbors
+                        UNWIND neighbors AS b
+                        UNWIND neighbors AS c
+                        WITH a, degree, b, c
+                        WHERE id(b) <> id(c)
+                        OPTIONAL MATCH (b)-[r:CONNECTED]->(c)
+                        WITH a, degree, count(r) AS directed_links
+                        RETURN toFloat(directed_links) / (degree * (degree - 1)) AS adapted_cc
+                    }
+                    RETURN avg(adapted_cc) AS avg_adapted_cc
+                """).single()
+                metrics['avg_clustering_adapted'] = result['avg_adapted_cc'] if result and result[
+                    'avg_adapted_cc'] is not None else 0.0
+            except Exception as e:
+                print(f"        ⚠ adapted CC failed: {e}")
+                metrics['avg_clustering_adapted'] = 0.0
+
+            # 6 + 7. Louvain Modularity + Communities
+            print("      louvain...")
+            try:
+                result = session.run(f"""
+                    CALL gds.louvain.stats('{undir_graph}')
+                    YIELD modularity, communityCount
+                    RETURN modularity, communityCount
+                """).single()
+                metrics['modularity'] = result['modularity']
+                metrics['communities'] = result['communityCount']
+            except Exception as e:
+                print(f"        ⚠ Louvain failed: {e}")
+                metrics['modularity'] = None
+                metrics['communities'] = None
+
+            # 8. Random Path Avg Cost
+            print("      random path cost...")
+            try:
+                result = session.run("""
+                    MATCH (source:RoadOsm), (target:RoadOsm)
+                    WHERE source.status = 'active' AND source.temp_status IS NULL
+                      AND target.status = 'active' AND target.temp_status IS NULL
+                      AND source <> target
+                    WITH source, target, rand() AS r
+                    ORDER BY r LIMIT 10000
+                    MATCH path = shortestPath((source)-[:CONNECTED*]-(target))
+                    WITH reduce(cost = 0.0, rel IN relationships(path) |
+                                cost + coalesce(rel.score, 1.0)) AS pathCost
+                    RETURN avg(pathCost) AS avg_cost
+                """).single()
+                metrics['random_path_avg_cost'] = result['avg_cost'] if result else None
+            except Exception as e:
+                print(f"        ⚠ random cost failed: {e}")
+                metrics['random_path_avg_cost'] = None
+
+            # 9. Random Path Avg Length
+            print("      random path length...")
+            try:
+                result = session.run("""
+                    MATCH (source:RoadOsm), (target:RoadOsm)
+                    WHERE source.status = 'active' AND source.temp_status IS NULL
+                      AND target.status = 'active' AND target.temp_status IS NULL
+                      AND source <> target
+                    WITH source, target, rand() AS r
+                    ORDER BY r LIMIT 10000
+                    MATCH path = shortestPath((source)-[:CONNECTED*]-(target))
+                    RETURN avg(length(path)) AS avg_length
+                """).single()
+                metrics['random_path_avg_length'] = result['avg_length'] if result else None
+            except Exception as e:
+                print(f"        ⚠ random length failed: {e}")
+                metrics['random_path_avg_length'] = None
+
+            # 10. Avg Harmonic Closeness
+            print("      harmonic closeness...")
+            try:
+                result = session.run(f"""
+                    CALL gds.alpha.closeness.harmonic.stream('{dir_graph}')
+                    YIELD nodeId, centrality
+                    RETURN avg(centrality) AS avg_hc
+                """).single()
+                metrics['avg_harmonic_closeness'] = result['avg_hc'] if result else None
+            except Exception as e:
+                print(f"        ⚠ HC failed: {e}")
+                metrics['avg_harmonic_closeness'] = None
+
+            # 11. Avg Betweenness (normalized)
+            print("      betweenness...")
+            try:
+                result = session.run(f"""
+                    CALL gds.betweenness.stream('{dir_graph}')
+                    YIELD nodeId, score
+                    RETURN avg(score) AS avg_bc, count(score) AS n_nodes
+                """).single()
+                if result and result['avg_bc'] is not None:
+                    n_nodes = result['n_nodes']
+                    denom = (n_nodes - 1) * (n_nodes - 2) / 2.0 if n_nodes > 2 else 1.0
+                    metrics['avg_betweenness_norm'] = result['avg_bc'] / denom
+                else:
+                    metrics['avg_betweenness_norm'] = None
+            except Exception as e:
+                print(f"        ⚠ BC failed: {e}")
+                metrics['avg_betweenness_norm'] = None
+
+        return metrics
+
+
+# ============================================================
+# HISTOGRAMS
+# ============================================================
+def create_histograms(all_results, output_dir):
+    print("\n  Creating histograms...")
+    os.makedirs(output_dir, exist_ok=True)
+
+    for scenario_name, data in all_results.items():
+        if 'pagerank_distribution' not in data:
+            continue
+        pr_vals = np.array(data['pagerank_distribution'])
+        if len(pr_vals) == 0:
+            continue
+
+        data_range = np.max(pr_vals) - np.min(pr_vals)
+        n_bins = max(80, min(200, int(data_range / 0.07)))
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.hist(pr_vals, bins=n_bins, color='steelblue',
+                edgecolor='none', alpha=0.85)
+        ax.set_xlabel('PageRank Score')
+        ax.set_ylabel('Number of Roads')
+        ax.set_title(f'PageRank Distribution — {scenario_name}',
+                     fontweight='bold')
+
+        stats_text = (f'N = {len(pr_vals)}\n'
+                      f'Mean = {np.mean(pr_vals):.4f}\n'
+                      f'Median = {np.median(pr_vals):.4f}\n'
+                      f'Std = {np.std(pr_vals):.4f}\n'
+                      f'Max = {np.max(pr_vals):.4f}')
+        ax.text(0.97, 0.95, stats_text, transform=ax.transAxes,
+                va='top', ha='right',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8),
+                fontsize=10, family='monospace')
+
+        plt.tight_layout()
+        safe = scenario_name.replace(' ', '_').replace('%', 'pct').lower()
+        plt.savefig(os.path.join(output_dir, f'hist_{safe}.png'))
+        plt.close()
+        print(f"    ✓ hist_{safe}.png")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    parser = argparse.ArgumentParser(description='Road Closure Resilience Analysis')
+    parser.add_argument('--neo4jURL', '-n', required=True)
+    parser.add_argument('--neo4juser', '-u', required=True)
+    parser.add_argument('--neo4jpwd', '-p', required=True)
+    parser.add_argument('--output', '-o', default='results_resilience')
+    args = parser.parse_args()
+
+    setup_plot_style()
+    os.makedirs(args.output, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    print(f"\n{'=' * 70}")
+    print("ROAD CLOSURE RESILIENCE ANALYSIS")
+    print(f"{'=' * 70}")
+    print(f"  Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Scenarios: 13 (non-closure + 6 top + 6 bottom)")
+    print(f"  Metrics: 10 per scenario")
+    print(f"{'=' * 70}")
+
+    analyzer = ResilienceAnalyzer(args.neo4jURL, args.neo4juser, args.neo4jpwd)
+    start = time.time()
+
+    # Step 1: Get PageRank on full network
+    print("\n  Step 1: PageRank on full network...")
+    analyzer.reset_closures()
+    analyzer.create_directed_projection('pr-full')
+    pr_df = analyzer.calculate_pagerank('pr-full')
+    analyzer.drop_projection('pr-full')
+    print(f"    ✓ {len(pr_df)} roads ranked")
+    print(f"    Top: {pr_df.iloc[0]['road_name']} (PR={pr_df.iloc[0]['pagerank']:.4f})")
+
+    # Step 2: Define scenarios
+    N = len(pr_df)
+    percentages = [0.02, 0.05, 0.10, 0.20, 0.30, 0.50]
+
+    scenarios = [{'name': 'Non-closure', 'roads': []}]
+
+    for pct in percentages:
+        count = int(N * pct)
+        scenarios.append({
+            'name': f'Close top {int(pct * 100)}%',
+            'roads': pr_df.head(count)['road_name'].tolist()
+        })
+
+    for pct in percentages:
+        count = int(N * pct)
+        scenarios.append({
+            'name': f'Close bottom {int(pct * 100)}%',
+            'roads': pr_df.tail(count)['road_name'].tolist()
+        })
+
+    # Step 3: Run each scenario
+    results = []
+    all_pr = {}
+
+    for i, scenario in enumerate(scenarios, 1):
+        print(f"\n  [{i}/{len(scenarios)}] {scenario['name']} "
+              f"({len(scenario['roads'])} roads closed)")
+
+        # Apply closures
+        analyzer.reset_closures()
+        analyzer.apply_closure(scenario['roads'])
+
+        # Create projections
+        dir_name = f'res-dir-{i}'
+        undir_name = f'res-undir-{i}'
+        analyzer.create_directed_projection(dir_name)
+        analyzer.create_undirected_projection(undir_name)
+
+        # Compute metrics
+        metrics = analyzer.calculate_scenario_metrics(dir_name, undir_name)
+
+        # PageRank distribution for histogram
+        try:
+            pr_scenario = analyzer.calculate_pagerank(dir_name)
+            all_pr[scenario['name']] = {
+                'pagerank_distribution': pr_scenario['pagerank'].tolist()
+            }
+        except Exception:
+            pass
+
+        # Cleanup projections
+        analyzer.drop_projection(dir_name)
+        analyzer.drop_projection(undir_name)
+
+        # Store result
+        row = {'Scenario': scenario['name'], 'Roads_Closed': len(scenario['roads'])}
+        row.update(metrics)
+        results.append(row)
+
+        print(f"    ✓ Done")
+
+    # Reset closures
+    analyzer.reset_closures()
+
+    # Step 4: Save CSV
+    results_df = pd.DataFrame(results)
+
+    # Reorder columns nicely
+    col_order = [
+        'Scenario', 'Roads_Closed',
+        'diameter', 'connected_components', 'avg_path_length',
+        'avg_clustering', 'avg_clustering_adapted',
+        'modularity', 'communities',
+        'random_path_avg_cost', 'random_path_avg_length',
+        'avg_harmonic_closeness', 'avg_betweenness_norm',
+    ]
+    col_order = [c for c in col_order if c in results_df.columns]
+    results_df = results_df[col_order]
+
+    csv_file = os.path.join(args.output, f'resilience_results_{timestamp}.csv')
+    results_df.to_csv(csv_file, index=False)
+    print(f"\n  💾 Results saved: {csv_file}")
+
+    # Step 5: Print table
+    print(f"\n{'=' * 70}")
+    print("RESILIENCE RESULTS")
+    print(f"{'=' * 70}")
+    print(results_df.to_string(index=False))
+    print(f"{'=' * 70}")
+
+    # Step 6: Histograms
+    create_histograms(all_pr, args.output)
+
+    # Step 7: Summary comparison plot
+    print("\n  Creating comparison plots...")
+
+    # Metrics to plot
+    plot_metrics = [
+        ('diameter', 'Diameter'),
+        ('connected_components', 'Connected Components'),
+        ('avg_path_length', 'Avg Path Length'),
+        ('avg_clustering', 'Avg Clustering (std)'),
+        ('avg_clustering_adapted', 'Avg Clustering (adapted)'),
+        ('modularity', 'Modularity Q'),
+        ('communities', 'Communities'),
+        ('random_path_avg_cost', 'Random Path Avg Cost'),
+        ('random_path_avg_length', 'Random Path Avg Length'),
+        ('avg_harmonic_closeness', 'Avg Harmonic Closeness'),
+        ('avg_betweenness_norm', 'Avg BC (normalized)'),
+    ]
+
+    # Split into top and bottom for cleaner comparison
+    non_closure = results_df[results_df['Scenario'] == 'Non-closure']
+    top_scenarios = results_df[results_df['Scenario'].str.contains('top')]
+    bot_scenarios = results_df[results_df['Scenario'].str.contains('bottom')]
+
+    for col, label in plot_metrics:
+        if col not in results_df.columns:
+            continue
+        vals = results_df[col].dropna()
+        if len(vals) == 0:
+            continue
+
+        fig, ax = plt.subplots(figsize=(12, 5))
+
+        # X positions
+        x_labels = results_df['Scenario'].tolist()
+        x = range(len(x_labels))
+        y = results_df[col].tolist()
+
+        # Color: green=non-closure, red=top, blue=bottom
+        colors = []
+        for s in x_labels:
+            if 'top' in s:
+                colors.append('#d7191c')
+            elif 'bottom' in s:
+                colors.append('#2c7bb6')
+            else:
+                colors.append('#1a9641')
+
+        bars = ax.bar(x, y, color=colors, alpha=0.85, edgecolor='white', linewidth=0.5)
+
+        # Baseline line
+        baseline = non_closure[col].values[0] if len(non_closure) > 0 else None
+        if baseline is not None:
+            ax.axhline(y=baseline, color='gray', linestyle='--', alpha=0.5, label='Baseline')
+
+        ax.set_ylabel(label)
+        ax.set_xticks(x)
+        ax.set_xticklabels(x_labels, rotation=45, ha='right', fontsize=8)
+        ax.legend()
+        plt.tight_layout()
+
+        safe_col = col.replace('_', '-')
+        plt.savefig(os.path.join(args.output, f'compare_{safe_col}.png'))
+        plt.close()
+
+    print("    ✓ comparison plots done")
+
+    elapsed = time.time() - start
+    print(f"\n{'=' * 70}")
+    print(f"  ✅ COMPLETE — {elapsed / 60:.1f} minutes")
+    print(f"  Results: {args.output}/")
+    print(f"{'=' * 70}\n")
+
+    analyzer.close()
+
+
+if __name__ == "__main__":
+    main()
