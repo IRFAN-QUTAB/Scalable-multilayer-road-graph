@@ -9,9 +9,7 @@ class App:
     def close(self):
         self.driver.close()
 
-    # =========================================================================
-    # STEP 1: Labels
-    # =========================================================================
+
     def set_labels(self):
         with self.driver.session() as session:
             session.execute_write(self._set_labels)
@@ -71,9 +69,7 @@ class App:
         """)
         print("? RoadOsm labels set")
 
-    # =========================================================================
-    # STEP 2: Location — from Code 1 and Code 3
-    # =========================================================================
+
     def set_location(self):
         with self.driver.session() as session:
             session.execute_write(self._set_location)
@@ -99,9 +95,7 @@ class App:
         """)
         print("? OSMNode locations set")
 
-    # =========================================================================
-    # STEP 3: Distance — from Code 1
-    # =========================================================================
+
     def set_distance(self):
         with self.driver.session() as session:
             session.execute_write(self._set_distance)
@@ -122,9 +116,6 @@ class App:
         """)
         print("? NEAR distances set")
 
-    # =========================================================================
-    # STEP 4: Driveable — from Code 3: mark_driveable_roadjunctions()
-    # =========================================================================
     def mark_driveable(self):
         with self.driver.session() as session:
             session.execute_write(self._mark_driveable)
@@ -152,9 +143,6 @@ class App:
         """)
         print("? Driveable junctions marked")
 
-    # =========================================================================
-    # STEP 5: Indexes — from Code 1, Code 3, Code 5
-    # =========================================================================
     def set_indexes(self):
         with self.driver.session() as session:
             session.execute_write(self._set_indexes)
@@ -177,9 +165,7 @@ class App:
         tx.run("CREATE INDEX IF NOT EXISTS FOR (n:RoadOsm) ON (n.name)")
         print("? Index on RoadOsm.name")
 
-    # =========================================================================
-    # STEP 6: Spatial Layer — from Code 1: generate_spatial_layer + import_nodes
-    # =========================================================================
+ 
     def generate_spatial_layer(self):
         with self.driver.session() as session:
             session.execute_write(self._generate_spatial_layer)
