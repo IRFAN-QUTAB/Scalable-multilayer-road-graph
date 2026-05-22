@@ -524,41 +524,6 @@ class DualGraphAnalyzer:
         return {"assortativity_r": r, "edge_count": M}
 
 
-    def calculate_random_path_metrics(self):
-        """
-        Random path average length + average cost.
-
-        Matches the original resilience analysis logic exactly:
-          - 1500 random source-target pairs
-          - Undirected traversal: [:CONNECTED*]-
-          - Cost = sum of relationship.score (default 1.0)
-          - Length = number of hops
-          - Skips closed roads (n.temp_status IS NULL)
-        """
-        print(f"\n  [+] Random path metrics...")
-
-        # ---- avg cost ----
-        with self.driver.session() as session:
-            try:
-                result = session.run("""
-                    MATCH (source:RoadOsm), (target:RoadOsm)
-                    WHERE source.temp_status IS NULL AND target.temp_status IS NULL
-                      AND source <> target
-                    WITH source, target, rand() AS r
-                    ORDER BY r
-                    LIMIT 1500
-                    MATCH path = shortestPath((source)-[:CONNECTED*]-(target))
-                    WITH path,
-                         reduce(cost = 0.0, rel IN relationships(path) |
-                                cost + coalesce(rel.score, 1.0)) AS pathCost
-                    RETURN avg(pathCost) AS avg_cost
-                """)
-                rec = result.single()
-                avg_cost = rec["avg_cost"] if rec and rec["avg_cost"] is not None else None
-            except Exception as e:
-                print(f"       ⚠ random path cost failed: {e}")
-                avg_cost = None
-
         # ---- avg length ----
         with self.driver.session() as session:
             try:
@@ -568,7 +533,7 @@ class DualGraphAnalyzer:
                       AND source <> target
                     WITH source, target, rand() AS r
                     ORDER BY r
-                    LIMIT 1500
+                    LIMIT 16000
                     MATCH path = shortestPath((source)-[:CONNECTED*]-(target))
                     RETURN avg(length(path)) AS avg_length
                 """)
@@ -577,13 +542,6 @@ class DualGraphAnalyzer:
             except Exception as e:
                 print(f"       ⚠ random path length failed: {e}")
                 avg_length = None
-
-        info = {
-            "random_path_avg_length": avg_length,
-            "random_path_avg_cost": avg_cost,
-        }
-        print(f"       avg length = {avg_length}, avg cost = {avg_cost}")
-        return info
 
 
     def calculate_assortativity_spectrum(self):
@@ -1104,8 +1062,6 @@ def main():
     path_info = analyzer.calculate_avg_path_length(sample_size=args.path_sample)
     _ = analyzer.calculate_diameter()
 
-    random_path_info = analyzer.calculate_random_path_metrics()
-
     assort_global = analyzer.calculate_global_assortativity(degree_df=deg_df)
     assort_spectrum_df = analyzer.calculate_assortativity_spectrum()
 
@@ -1246,9 +1202,6 @@ def main():
         "std_path_length_sampled": path_info.get("std_path_length"),
         "diameter_lower_bound": path_info.get("sampled_diameter"),
         "path_pairs_computed": path_info.get("pairs_computed"),
-        # Random path metrics (1500 random pairs, undirected, weighted by score)
-        "random_path_avg_length": random_path_info.get("random_path_avg_length"),
-        "random_path_avg_cost": random_path_info.get("random_path_avg_cost"),
         # Assortativity
         "assortativity_r": assort_global.get("assortativity_r"),
         # Conductance
