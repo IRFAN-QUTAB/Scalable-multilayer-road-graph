@@ -246,44 +246,6 @@ class ResilienceAnalyzer:
                 metrics['modularity'] = None
                 metrics['communities'] = None
 
-            # 8. Random Path Avg Cost
-            print("      random path cost...")
-            try:
-                result = session.run("""
-                    MATCH (source:RoadOsm), (target:RoadOsm)
-                    WHERE source.status = 'active' AND source.temp_status IS NULL
-                      AND target.status = 'active' AND target.temp_status IS NULL
-                      AND source <> target
-                    WITH source, target, rand() AS r
-                    ORDER BY r LIMIT 10000
-                    MATCH path = shortestPath((source)-[:CONNECTED*]-(target))
-                    WITH reduce(cost = 0.0, rel IN relationships(path) |
-                                cost + coalesce(rel.score, 1.0)) AS pathCost
-                    RETURN avg(pathCost) AS avg_cost
-                """).single()
-                metrics['random_path_avg_cost'] = result['avg_cost'] if result else None
-            except Exception as e:
-                print(f"        ⚠ random cost failed: {e}")
-                metrics['random_path_avg_cost'] = None
-
-            # 9. Random Path Avg Length
-            print("      random path length...")
-            try:
-                result = session.run("""
-                    MATCH (source:RoadOsm), (target:RoadOsm)
-                    WHERE source.status = 'active' AND source.temp_status IS NULL
-                      AND target.status = 'active' AND target.temp_status IS NULL
-                      AND source <> target
-                    WITH source, target, rand() AS r
-                    ORDER BY r LIMIT 10000
-                    MATCH path = shortestPath((source)-[:CONNECTED*]-(target))
-                    RETURN avg(length(path)) AS avg_length
-                """).single()
-                metrics['random_path_avg_length'] = result['avg_length'] if result else None
-            except Exception as e:
-                print(f"        ⚠ random length failed: {e}")
-                metrics['random_path_avg_length'] = None
-
             # 10. Avg Harmonic Closeness
             print("      harmonic closeness...")
             try:
@@ -374,7 +336,7 @@ def main():
     print(f"{'=' * 70}")
     print(f"  Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Scenarios: 13 (non-closure + 6 top + 6 bottom)")
-    print(f"  Metrics: 10 per scenario")
+    print(f"  Metrics: 8 per scenario")
     print(f"{'=' * 70}")
 
     analyzer = ResilienceAnalyzer(args.neo4jURL, args.neo4juser, args.neo4jpwd)
@@ -462,7 +424,6 @@ def main():
         'diameter', 'connected_components', 'avg_path_length',
         'avg_clustering', 'avg_clustering_adapted',
         'modularity', 'communities',
-        'random_path_avg_cost', 'random_path_avg_length',
         'avg_harmonic_closeness', 'avg_betweenness_norm',
     ]
     col_order = [c for c in col_order if c in results_df.columns]
@@ -494,8 +455,6 @@ def main():
         ('avg_clustering_adapted', 'Avg Clustering (adapted)'),
         ('modularity', 'Modularity Q'),
         ('communities', 'Communities'),
-        ('random_path_avg_cost', 'Random Path Avg Cost'),
-        ('random_path_avg_length', 'Random Path Avg Length'),
         ('avg_harmonic_closeness', 'Avg Harmonic Closeness'),
         ('avg_betweenness_norm', 'Avg BC (normalized)'),
     ]
