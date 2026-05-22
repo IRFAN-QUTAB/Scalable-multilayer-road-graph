@@ -143,7 +143,7 @@ python "Network Analysis Algorithms" -n bolt://localhost:7687 -u neo4j -p passwo
 | `-p` | Neo4j password |
 | `-o` | Output folder for results (default: results) |
 
-**Computed metrics:** PageRank, Betweenness Centrality, Harmonic Closeness, Degree Distribution (with Clauset MLE power-law fit), Clustering Coefficient (standard and adapted), Connected Components (WCC + SCC), Louvain Community Detection, Average Path Length, Diameter, Assortativity (Newman's r), and Conductance.
+**Computed metrics:** PageRank, Betweenness Centrality, Harmonic Closeness, Degree Distribution (with Clauset MLE power-law fit), Clustering Coefficient (standard and adapted), Connected Components (WCC + SCC), Louvain Community Detection, Average Path Length, Diameter, Assortativity (Newman's r).
 
 **Output:** CSV files with node-level metrics, graph summary, degree distribution, clustering and assortativity spectra, conductance per community. Plots include degree distribution, log-log P(k), clustering spectrum, assortativity spectrum, correlation matrix, scatter plots, centrality histograms, and community size distribution.
 
@@ -164,7 +164,7 @@ python "Resilience Analysis" -n bolt://localhost:7687 -u neo4j -p password -o re
 | `-p` | Neo4j password |
 | `-o` | Output folder (default: results_resilience) |
 
-**Metrics per scenario:** Diameter, Connected Components, Average Path Length, Clustering Coefficient (standard and adapted), Modularity, Communities, Random Path Average Cost, Random Path Average Length, Average Harmonic Closeness, and Average Betweenness (normalized).
+**Metrics per scenario:** Diameter, Connected Components, Average Path Length, Clustering Coefficient (standard and adapted), Modularity, Communities, Average Harmonic Closeness, and Average Betweenness.
 
 **Output:** Comparison CSV with all scenarios, PageRank distribution histograms per scenario, and bar charts comparing each metric across scenarios.
 
