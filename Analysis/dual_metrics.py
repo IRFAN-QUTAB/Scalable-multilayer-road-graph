@@ -1,28 +1,4 @@
-"""
-Structural analysis of a dual graph (Section "Metrics" of the paper), computed on the CSV files written by
-dual_graph.py (dual_nodes.csv, dual_edges.csv). The same script is used for every city and for
-every dual graph (name-based, name_split, strokes), so that all the results are computed in the same way.
 
-Metrics (formulas of the paper):
-  degree            number of distinct neighbouring roads (directions ignored), in- and out-degree
-  betweenness       Brandes, directed shortest paths (hops); raw value and value / ((N-1)(N-2))
-  pagerank          PR(v) = (1-d) + d * sum_{u->v} PR(u)/L(u), d = 0.85, iterated until convergence
-  harmonic          C_H(v) = 1/(N-1) * sum_{u != v} 1/d(v,u), directed distances (0 if no path)
-  clustering        C(i) = 2 E_i / (k_i (k_i - 1)) on the undirected graph (0 if k_i < 2)
-  adapted_cc        C_a(n) = (directed links between the neighbours of n) / (k_n (k_n - 1))
-  components        weakly and strongly connected components
-  path length       exact mean of the directed shortest-path lengths (hops) over all reachable ordered pairs
-  diameter          exact largest directed shortest-path length
-  assortativity     Newman r on the undirected graph (each edge once), and k_nn(k)
-  communities       Louvain on the undirected graph, several seeds (modularity Q of the paper)
-  conductance       per community: external / total directed edges (communities with more than 3 roads)
-  power law         Clauset, Shalizi and Newman (2009): alpha, xmin, tail size, KS distance, bootstrap
-                    goodness-of-fit p-value, likelihood-ratio tests against lognormal, exponential and
-                    truncated power law
-
-Usage:
-  python3 dual_metrics.py --dual-dir rome_dual/name_split --label "Rome name_split" --output analysis/rome_name_split
-"""
 import argparse
 import json
 import os
