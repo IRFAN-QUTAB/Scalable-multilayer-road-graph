@@ -1,22 +1,3 @@
-"""
-Long POI links: which POIs are linked to a road junction that is far away.
-
-Reads the output of poi_layer_parallel.py (combined_nodes.csv and combined_edges.csv) of one or more areas and
-writes, in one run:
-  long_links.csv          every NEAR link of at least --min-distance metres: area, POI (id, type, name, amenity,
-                          access), the node the link starts from (POI node, building centroid, outline node,
-                          entrance node), rule (R1/R2/R3), distance, coordinates of both ends
-  far_pois.csv            the POIs whose NEAREST link (over the POI node, the centroid and all the outline nodes of
-                          the building) is at least --min-distance metres: these POIs are really far from the
-                          road network, a building with only one far corner is not counted
-  long_links.geojson      one line per long link (POI side -> junction), to look at them in QGIS
-  long_links_summary.txt  counts per area: links and POIs above every distance of --report-distances, by rule,
-                          by kind of node, by amenity
-
-Usage (the three areas in one run):
-  python3 poi_long_links.py --area Modena=modena_poi --area Rome=rome_poi --area PoDelta=podelta_poi \
-      --output poi_long_links
-"""
 import argparse
 import json
 import os
