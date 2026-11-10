@@ -1,24 +1,4 @@
-"""
-Comparison of the dual graphs of one city built with different road definitions (name-based, name_split, strokes).
 
-  1. size of the roads in every dual graph: number of roads, length (mean, median, 90th percentile, maximum),
-     share of the network length in the longest 1% of the roads, extent (span) of the roads
-  2. centralities seen from the road segments: every road segment of the primal graph takes the value of the road
-     that contains it in each dual graph; Spearman rank correlation between two dual graphs over the segments
-     present in both, and overlap of the top 10% (share of the length of the top-10% segments of one dual graph
-     that is also in the top 10% of the other)
-  4. the main metrics of every dual graph side by side (summary.json of dual_metrics.py): metrics_summary.csv
-  3. name variants: names that become identical after lower case, removal of accents, punctuation and repeated
-     spaces (e.g. 'Via Roma' / 'via Roma'), with their length
-
-Inputs: edge_keys.csv and the primal relationships CSV (lengths), and the node_metrics.csv written by dual_metrics.py
-for each dual graph.
-
-Usage:
-  python3 compare_dual_graphs.py --rels-csv .../fullgraph_rels.csv --edge-keys .../rome_dual/edge_keys.csv \
-      --metrics name=.../analysis/rome_name name_split=.../analysis/rome_name_split stroke=.../analysis/rome_strokes \
-      --output .../analysis/rome_compare
-"""
 import argparse
 import itertools
 import json
