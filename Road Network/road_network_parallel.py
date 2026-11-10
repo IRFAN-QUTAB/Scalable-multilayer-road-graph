@@ -1,20 +1,3 @@
-"""
-Cell-based parallel construction of the road network graph (primal graph) of a study area.
-
-The study area (square of side 2D around the centre) is divided into overlapping cells; every cell is downloaded
-with OSMnx and built in a separate worker process, and the cells are merged into one graph (boundary filter and
-largest weakly connected component). The cell CSV files are read with several threads, the merged tables are kept
-in memory, the connected components are computed with scipy.sparse.csgraph, and the final CSV files
-(fullgraph_nodes.csv, fullgraph_rels.csv, in the input format of neo4j-admin import) are written once.
-
-Measurements, written to diagnostics.txt, cell_timings.csv and monitor_samples.csv:
-     - for every cell: time of the Overpass requests, time of the OSMnx graph construction, time of
-       the CSV writing, process id;
-     - during the run: memory, system CPU use, load average, and the number of running Overpass
-       server processes (interpreter / osm3s_query), so that the waiting time of the workers on the
-       Overpass server can be shown directly;
-     - time of every sub-step of the merge and of the largest component.
-"""
 import osmnx as ox
 import argparse
 import os
