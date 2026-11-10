@@ -1,35 +1,4 @@
-"""
-Origin-destination pairs without a path after the closures of dual_closures.py: how many of them have an origin or a
-destination that is left without any open driveable road, and how many are separated by the closures although both
-end points still have an open road.
 
-A closure removes every segment of the closed roads. A junction that lies only on closed roads (for example a junction
-in the middle of a closed road) has no open road left, so every pair that starts or ends there has no path. The other
-pairs without a path are separated by the closures.
-
-The closed roads of every scenario are selected again in the same way as dual_closures.py (same rankings from
-road_rankings.csv, same length budgets, same random generator), and the result is checked against closures.csv
-(number of closed roads, removed length, pairs without a path). No route is computed again: the distances are read
-from od_routes.csv.
-
-Output (in the closures folder): od_endpoint_check.csv, one row per scenario:
-  pairs_no_path                    pairs without a path (as in closures.csv)
-  no_path_endpoint_without_road    of these, pairs whose origin has no open outgoing road or whose destination has
-                                   no open incoming road
-  no_path_separated                the other pairs without a path
-  pairs_endpoints_open             pairs whose origin and destination are not junctions of a closed road
-  no_path_endpoints_open           pairs without a path among them
-  (and the same values in % of all pairs, and in % of pairs_endpoints_open for the last one)
-
-Section closures (section_closures.csv): the nearby pairs of each of the top roads are drawn again in the same way as
-dual_closures.py (same random generator), their routes are computed again without the 1 km stretch and without the
-whole road, and the same split is written to od_endpoint_check_sections.csv (checked against the share of nearby pairs
-without a path in section_closures.csv).
-
-Usage:
-  python3 od_endpoint_check.py --nodes-csv .../fullgraph_nodes.csv --rels-csv .../fullgraph_rels.csv \
-      --edge-keys .../edge_keys.csv --key name --closures .../analysis/rome_name_closures
-"""
 import argparse
 import math
 import os
