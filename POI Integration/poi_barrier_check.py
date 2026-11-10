@@ -1,30 +1,3 @@
-"""
-Barriers between POIs and their road junctions.
-
-Reads the output of the POI script (combined_nodes.csv and combined_edges.csv) of one or more areas, downloads
-the barrier lines of OpenStreetMap (barrier=fence, wall, hedge, ... as ways) from an Overpass server, and checks,
-for every NEAR link, whether the straight line from the linked point (POI node, building centroid, outline or
-entrance node) to its road junction crosses a mapped barrier line.
-
-The POI files are only read, nothing is changed. The links are built exactly as in poi_long_links.py (same
-functions), so the counts can be compared.
-
-A link "crosses" a barrier when its straight line crosses a segment of a barrier line at an inner point of both
-segments (proper intersection); a link that only touches a barrier at one of its ends, or runs along it, is not
-counted. A crossing does not mean that the POI cannot be reached (a fence can have a
-gate that is not mapped as a gap), and barriers that are not mapped in OSM are not seen: the result is the share
-of links whose straight line crosses a mapped barrier line.
-
-Outputs (folder --output):
-  barrier_summary.txt     per area: barrier lines downloaded, links crossing a barrier (by rule and kind of
-                          node), POIs with at least one link that crosses no barrier, nearest link of each POI
-  crossing_links.csv      every link that crosses a barrier (area, POI, node, rule, distance, barrier type)
-  crossing_links.geojson  the same links as lines, to look at them in QGIS
-
-Usage:
-  python3 poi_barrier_check.py --overpass-url http://localhost:12351/api/interpreter \
-      --area Modena=modena_poi --area Rome=rome_poi --area PoDelta=podelta_poi --output poi_barrier_check
-"""
 import argparse
 import json
 import math
