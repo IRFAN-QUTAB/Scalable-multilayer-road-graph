@@ -1,7 +1,6 @@
 # Scalable Multi-Layer Graph Framework for Road Network Analysis and Disruption Simulation
 
-Code of the paper *A Scalable Multi-Layer Graph Framework for Road Network Analysis and Disruption Simulation*
-(I. Qutab, L. Po, F. Rollo, C. Bachechi).
+Code of the paper *A Scalable Multi-Layer Graph Framework for Road Network Analysis and Disruption Simulation*.
 
 The framework builds, from OpenStreetMap (OSM) data, a multi-layer graph of a study area: the road network
 (primal graph), the points of interest (POIs) linked to the road network, and the dual graph of the roads. The
@@ -166,17 +165,3 @@ python3 scaling_benchmark.py --latitude 44.507836 --longitude 11.883350 --distan
     --overpass-url URL --output-base scaling --workers 1 2 4 8 16 32 --repeats 3
 python3 cell_overlap_benchmark.py --latitude 41.9028 --longitude 12.4964 --distance 18.5 \
     --combinations 5:2 5:1 5:0 10:2 2:1 --workers 16 --repeats 3 --overpass-url URL --output-base cell_overlap
-```
-
-### 7. Figures
-
-```shell
-cd 7_figures
-python3 make_paper_figures.py --analysis ../5_analysis/analysis --city Modena modena --city Rome rome --output paper_figures
-python3 make_paper_maps_png.py --analysis ../5_analysis/analysis \
-    --city Modena modena modena_cell modena_dual 50 --city Rome rome rome_cell rome_dual 100 --output paper_maps
-```
-
-`make_paper_maps.py` writes the same maps as interactive HTML files. `make_study_area_maps.py` draws the road
-network graphs of the study areas (folders set in `AREAS`), and `make_scaling_figure.py` the scaling figure from
-the summary of `scaling_benchmark.py`.
