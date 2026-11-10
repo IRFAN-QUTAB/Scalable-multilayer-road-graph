@@ -87,7 +87,7 @@ python3 compare_with_single_request.py --cell-nodes rome_cell/fullgraph_nodes.cs
 
 `road_network_single_request.py` takes the distance in metres.
 
-### 2. POIs
+### 2. POI Integration
 
 ```shell
 cd 2_poi
