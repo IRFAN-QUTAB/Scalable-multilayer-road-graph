@@ -1,0 +1,14 @@
+osmnx==2.0.2
+networkx==3.7
+pandas==3.1.0
+numpy==2.2.4
+scipy==1.15.3
+python-igraph==1.0.0
+powerlaw==2.0.0
+momepy==1.0.0
+psutil
+overpy
+neo4j
+matplotlib
+folium
+contextily
