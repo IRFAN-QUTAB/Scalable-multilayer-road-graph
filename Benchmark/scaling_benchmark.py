@@ -1,19 +1,4 @@
-"""
-Scaling benchmark: the same study area is built with road_network_parallel.py with different numbers of
-worker processes (--workers), and every setting can be repeated (--repeats). The repeats are
-done in rounds (1, 2, 4, 8, 16, 32, then again 1, 2, ...), so that a change of the load of the
-server affects all settings in the same way. The summary reports the median of the repeats.
 
-For every run it also writes the measurements of diagnostics.txt: waiting time for the Overpass
-server per cell, OSMnx construction time per cell, share of waiting, CPU use, load average of the
-server, number of running Overpass server processes, and the time of every sub-step of the merge
-and of the largest component.
-
-Usage (Po Delta, D = 80 km, cell 5 km, overlap 2 km):
-  python3 scaling_benchmark.py --latitude 44.507836 --longitude 11.883350 --distance 80 \
-      --area-size 5 --overlap 2 --overpass-url http://localhost:12351/api/interpreter \
-      --output-base scaling --workers 1 2 4 8 16 32 --repeats 3
-"""
 import argparse
 import datetime
 import os
