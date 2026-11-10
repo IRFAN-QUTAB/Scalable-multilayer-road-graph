@@ -1,21 +1,4 @@
-"""
-Benchmark of the cell size and the overlap.
 
-The same study area is built with road_network_parallel.py for several combinations of cell size s and
-overlap e (same number of workers). For every combination the results file reports:
-  - number of cells, time of each phase (download, merge, largest component) and total construction time
-  - peak memory (all processes, largest process)
-  - duplicated work: sum of the nodes (and edges) of all cells divided by the nodes (and edges) of the final graph;
-    the cells overlap and the border cells extend beyond the study area, so the same nodes are built more than once
-  - expected overlap factor (s / (s - e))^2 of the complexity formula, next to the measured duplication
-  - fingerprint of the final graph (node ids, and edges as start node, end node, OSM way id), to check that the
-    graph is identical for all combinations
-
-Usage (Rome, D = 18.5 km, 16 workers):
-  python3 cell_overlap_benchmark.py --latitude 41.9028 --longitude 12.4964 --distance 18.5 \
-      --combinations 5:2 5:1 5:0 10:2 2:1 --workers 16 \
-      --overpass-url http://localhost:12351/api/interpreter --output-base cell_overlap
-"""
 import argparse
 import csv
 import datetime
