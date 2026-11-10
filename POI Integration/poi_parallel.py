@@ -1,14 +1,3 @@
-"""
-POIs of a study area linked to the road network graph (CSV files of the cell-based pipeline).
-
-The cells are processed in parallel by separate processes (--workers), as the road network script: every process
-downloads the POIs of one cell from the Overpass server and links them to the road junctions. The results of the
-cells are put together in the order of the cells, so the output does not depend on the number of processes
-(--workers 1 = one cell after the other, in a single process).
-
-Measured and written in poi_paper_results.txt: time of each phase, waiting time for the Overpass server and
-linking time per cell, peak memory (all processes and largest single process).
-"""
 import overpy
 import json
 import argparse
