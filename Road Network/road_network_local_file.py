@@ -1,28 +1,4 @@
-"""
-Single OSMnx graph construction from a local OSM file.
 
-The graph is built exactly as in road_network_single_request.py (ox.graph_from_point with the same
-center, distance, dist_type='bbox', simplify=False and the same highway filter). The only
-difference is the data source: instead of the Overpass API, the OSM data are read from a local
-.osm.pbf file (the Geofabrik file of the same OSM snapshot as the local Overpass server).
-
-Steps (each step is timed):
-  1. osmium extract     : cut the study area (plus a 2 km margin) from the .osm.pbf file
-  2. osmium tags-filter : keep only the ways with a highway tag, write OSM XML
-  3. OSMnx              : read the XML file and build the graph with the same OSMnx code
-                          (500 m buffer, truncation, largest component, street_count) as a single request
-  4. GraphML file       : written as in road_network_single_request.py (timed separately)
-Optional step 5: compare_with_single_request.py against the cell-based graph (--compare-cell-dir), after all the
-times have been written, so that the comparison does not change the measured times.
-
-Everything is written to local_file_results.txt in --work-dir: system (cores, RAM, load average),
-file and OSM data timestamp, osmium and OSMnx versions, time of each step, peak memory (this script and
-the osmium processes, also when osmium runs inside the Docker container), nodes, edges, connectivity.
-
-Requires osmium-tool (command "osmium"), or a Docker container that contains it
-(--docker-container overpass --docker-mount /path/to/overpass_db:/db;
-the .pbf file and --work-dir must then be inside /path/to/overpass_db).
-"""
 import argparse
 import datetime
 import os
