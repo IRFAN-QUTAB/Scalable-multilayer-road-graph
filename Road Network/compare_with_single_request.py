@@ -1,20 +1,4 @@
-"""
-Compare the primal graph built with the cell-based pipeline (fullgraph_nodes.csv,
-fullgraph_rels.csv) with the graph built with a single OSMnx request (GraphML file
-saved by road_network_single_request.py --output-file).
 
-Checks:
-  1. node identities (OSM node ids) and node coordinates
-  2. edge identities as directed triples (source, target, OSM way id), i.e. directionality
-  3. parallel edges (more than one edge between the same source and target)
-  4. edge attributes of the common edges
-  5. shortest-path consistency on random origin-destination pairs (length as weight)
-
-Usage:
-  python3 compare_with_single_request.py --cell-nodes modena_cell/fullgraph_nodes.csv \
-      --cell-rels modena_cell/fullgraph_rels.csv \
-      --single-graphml modena_single.graphml --pairs 500 --report modena_comparison.txt
-"""
 import argparse
 import math
 import random
