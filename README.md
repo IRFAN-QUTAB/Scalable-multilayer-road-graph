@@ -89,7 +89,6 @@ python3 compare_with_single_request.py --cell-nodes rome_cell/fullgraph_nodes.cs
 ### 2. POI Integration
 
 ```shell
-cd 2_poi
 python3 poi_layer_parallel.py --nodes-csv ../1_road_network/rome_cell/fullgraph_nodes.csv \
     --rels-csv ../1_road_network/rome_cell/fullgraph_rels.csv --output rome_poi \
     --latitude 41.9028 --longitude 12.4964 --distance 18.5 --area-size 5 --overpass-url URL --workers 16
@@ -106,7 +105,6 @@ the driveable network.
 ### 3. Dual graphs
 
 ```shell
-cd 3_dual_graph
 python3 dual_graph.py -n ../1_road_network/rome_cell/fullgraph_nodes.csv \
     -r ../1_road_network/rome_cell/fullgraph_rels.csv -o rome_dual --split-gap 2000
 ```
@@ -134,7 +132,6 @@ writes); they are used for the comparison of the construction strategies.
 ### 5. Analysis
 
 ```shell
-cd 5_analysis
 python3 dual_metrics.py --dual-dir ../3_dual_graph/rome_dual --label "Rome name" --output analysis/rome_name --bootstrap 2500
 python3 dual_closures.py --nodes-csv ../1_road_network/rome_cell/fullgraph_nodes.csv \
     --rels-csv ../1_road_network/rome_cell/fullgraph_rels.csv --edge-keys ../3_dual_graph/rome_dual/edge_keys.csv \
@@ -159,7 +156,6 @@ type).
 ### 6. Benchmarks
 
 ```shell
-cd 6_benchmarks
 python3 scaling_benchmark.py --latitude 44.507836 --longitude 11.883350 --distance 80 --area-size 5 --overlap 2 \
     --overpass-url URL --output-base scaling --workers 1 2 4 8 16 32 --repeats 3
 python3 cell_overlap_benchmark.py --latitude 41.9028 --longitude 12.4964 --distance 18.5 \
