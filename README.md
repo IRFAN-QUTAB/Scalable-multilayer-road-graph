@@ -13,27 +13,26 @@ simulate road closures, with routing on the primal graph.
 
 | Folder | Script | What it does |
 |---|---|---|
-| `1_road_network` | `road_network_parallel.py` | Cell-based parallel construction of the road network graph (primal graph) |
+| `Road_Network` | `road_network_parallel.py` | Cell-based parallel construction of the road network graph (primal graph) |
 | | `road_network_sequential.py` | Same construction, one cell after the other in a single process |
 | | `road_network_single_request.py` | Road network graph of the same area with a single OSMnx request (reference graph); GraphML file or Neo4j |
 | | `road_network_local_file.py` | Single OSMnx graph built from a local `.osm.pbf` file (osmium) |
 | | `compare_with_single_request.py` | Compares the cell-based graph with the single-request graph (nodes, directed edges, attributes, shortest paths) |
-| `2_poi` | `poi_layer_parallel.py` | POIs downloaded cell by cell in parallel worker processes and linked to the road network (rules R1, R2, R3) |
+| `POI Integration` | `poi_layer_parallel.py` | POIs downloaded cell by cell in parallel worker processes and linked to the road network (rules R1, R2, R3) |
 | | `poi_layer_sequential.py` | Same POI layer, one cell after the other in a single process |
 | | `poi_long_links.py` | Length of the POI links, links and POIs above given distances |
 | | `poi_barrier_check.py` | Share of the POI links whose straight line crosses a barrier mapped in OSM |
-| `3_dual_graph` | `dual_graph.py` | Dual graphs: name-based (main), name_split and stroke-based (COINS, momepy) |
-| `4_neo4j` | `neo4j_road_network.py` | Road network written cell by cell into Neo4j (transactional writes) |
+| `Dual_Graph` | `dual_graph.py` | Dual graphs: name-based (main), name_split and stroke-based (COINS, momepy) |
+| `Neo4j` | `neo4j_road_network.py` | Road network written cell by cell into Neo4j (transactional writes) |
 | | `neo4j_poi_layer.py` | POI layer written cell by cell into Neo4j |
 | | `neo4j_post_import.py` | Labels, locations, distances, driveable flag, indexes and spatial layer after `neo4j-admin import` |
-| `5_analysis` | `dual_metrics.py` | Structural metrics of a dual graph |
+| `Analysis` | `dual_metrics.py` | Structural metrics of a dual graph |
 | | `dual_closures.py` | Road closure scenarios and routing on origin-destination pairs |
 | | `compare_dual_graphs.py` | Comparison of the three dual graphs of a city (road length, centralities) |
 | | `od_endpoint_check.py` | Splits the pairs without a path into pairs with an end point on a closed road and separated pairs |
-| `6_benchmarks` | `scaling_benchmark.py` | Construction time and memory with different numbers of worker processes |
+| `Benchmarks` | `scaling_benchmark.py` | Construction time and memory with different numbers of worker processes |
 | | `cell_overlap_benchmark.py` | Construction time, memory and duplicated work for different cell sizes and overlaps |
-| | `compare_csv_rows.py` | Checks that two CSV files have the same columns and rows (any order) |
-| `7_figures` | `make_paper_figures.py`, `make_paper_maps_png.py`, `make_paper_maps.py`, `make_study_area_maps.py`, `make_scaling_figure.py` | Figures and maps of the paper |
+| | `compare_csv_rows.py` | Checks that two CSV files have the same columns and rows|
 
 ## Requirements
 
