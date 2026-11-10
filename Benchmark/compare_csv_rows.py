@@ -1,9 +1,4 @@
-"""
-Compares two CSV files by content: same column names (in any order) and the same rows (in any order).
-Prints "same rows" when the content is equal; otherwise what differs.
 
-Usage: python3 compare_csv_rows.py new.csv old.csv
-"""
 import sys
 
 import pandas as pd
