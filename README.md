@@ -1,6 +1,6 @@
 # Scalable Multi-Layer Graph Framework for Road Network Analysis and Disruption Simulation
 
-Code of the paper *A Scalable Multi-Layer Graph Framework for Road Network Analysis and Disruption Simulation*.
+*A Scalable Multi-Layer Graph Framework for Road Network Analysis and Disruption Simulation*.
 
 The framework builds, from OpenStreetMap (OSM) data, a multi-layer graph of a study area: the road network
 (primal graph), the points of interest (POIs) linked to the road network, and the dual graph of the roads. The
